@@ -199,6 +199,84 @@ class Test(unittest.TestCase):
             [list(row) for row in pixels], [list(row) for row in flat]
         )
 
+    def test_pack_rows_spec(self):
+        """pack_rows packs values most-significant-bits first,
+        with zero padding at the end of the row (PNG spec)."""
+        # 1-bit: 8 values fill one byte; a 9th value starts a new byte.
+        rows = png.pack_rows([[1, 0, 1, 1, 0, 0, 0, 1, 1]], 1)
+        self.assertEqual(list(rows), [bytearray([0b10110001, 0b10000000])])
+        # 2-bit: 4 values fill one byte; a 5th value starts a new byte.
+        rows = png.pack_rows([[0, 1, 2, 3, 1]], 2)
+        self.assertEqual(list(rows), [bytearray([0b00011011, 0b01000000])])
+        # 4-bit: 2 values fill one byte; a 3rd value starts a new byte.
+        rows = png.pack_rows([[0xA, 0x5, 0xF]], 4)
+        self.assertEqual(list(rows), [bytearray([0xA5, 0xF0])])
+
+    def test_unpack_bits_spec(self):
+        """unpack_bits unpacks most-significant-bits first,
+        discarding padding bits at the end of the row."""
+        self.assertEqual(
+            list(png.unpack_bits(bytes([0b10110001, 0b10000000]), 1, 9)),
+            [1, 0, 1, 1, 0, 0, 0, 1, 1],
+        )
+        self.assertEqual(
+            list(png.unpack_bits(bytes([0b00011011, 0b01000000]), 2, 5)),
+            [0, 1, 2, 3, 1],
+        )
+        self.assertEqual(
+            list(png.unpack_bits(bytes([0xA5, 0xF0]), 4, 3)),
+            [0xA, 0x5, 0xF],
+        )
+
+    def test_pack_unpack_roundtrip(self):
+        """pack_rows and unpack_bits are exact inverses
+        for every low bit depth and every row width."""
+        for bitdepth in (1, 2, 4):
+            maxval = 2**bitdepth - 1
+            for width in range(1, 33):
+                row = [(i * 5 + width) & maxval for i in range(width)]
+                packed = b"".join(png.pack_rows([row], bitdepth))
+                # Number of bytes is ceil(width * bitdepth / 8).
+                self.assertEqual(len(packed), (width * bitdepth + 7) // 8)
+                unpacked = png.unpack_bits(packed, bitdepth, width)
+                self.assertEqual(list(unpacked), row)
+
+    def test_low_bitdepth_roundtrip(self):
+        """Write then read greyscale and palette images
+        at bit depths 1, 2, and 4; values must be unchanged."""
+        for bitdepth in (1, 2, 4):
+            maxval = 2**bitdepth - 1
+            for width in (1, 3, 7, 8, 9, 17):
+                rows = [
+                    [(i * 3 + j * 5 + width) & maxval for i in range(width)]
+                    for j in range(3)
+                ]
+                palette = [
+                    (i * 37 % 256, i * 91 % 256, i * 53 % 256)
+                    for i in range(2**bitdepth)
+                ]
+                for k in (
+                    dict(greyscale=True, bitdepth=bitdepth),
+                    dict(palette=palette, bitdepth=bitdepth),
+                ):
+                    bytes = topngbytes("lowbd.png", rows, width, 3, **k)
+                    x, y, pixels, meta = png.Reader(bytes=bytes).read()
+                    self.assertEqual([list(row) for row in pixels], rows)
+
+    def test_low_bitdepth_cross(self):
+        """Rescaling a low bit depth image to 8-bit uses
+        round(v * 255 / maxval); check asRGB8 for all low bit depths."""
+        for bitdepth in (1, 2, 4):
+            maxval = 2**bitdepth - 1
+            rows = [[(i * 7) & maxval for i in range(5)]]
+            bytes = topngbytes(
+                "crossbd.png", rows, 5, 1, greyscale=True, bitdepth=bitdepth
+            )
+            x, y, pixels, meta = png.Reader(bytes=bytes).asRGB8()
+            expect = [[int(round(v * 255 / maxval))] * 3 for v in rows[0]]
+            expect = [list(itertools.chain(*expect))]
+            self.assertEqual([list(row) for row in pixels], expect)
+
     def test_RGB_to_RGBA(self):
         """asRGBA8() on colour type 2 source."""
         # Test for Issue 26 (googlecode)

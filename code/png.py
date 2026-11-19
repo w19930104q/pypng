@@ -159,7 +159,10 @@ When packed, each row is a sequence of bytes (integers from 0 to 255),
 just as it is before PNG scanline filtering is applied.
 When the bit depth is 8 this is the same as a sequence of rows;
 when the bit depth is less than 8 (1, 2 and 4),
-several pixels are packed into each byte;
+several pixels are packed into each byte
+(the first pixel occupying the most significant bits,
+with any bits left over at the end of the row set to zero,
+exactly as in the PNG specification);
 when the bit depth is 16 each pixel value is decomposed into 2 bytes
 (and `packed` is a misnomer).
 This format is used by the :meth:`Writer.write_packed` method.
@@ -970,13 +973,23 @@ def rescale_rows(rows, rescale):
 def pack_rows(rows, bitdepth):
     """Yield packed rows that are a byte array.
     Each byte is packed with the values from several pixels.
+
+    The packing follows the PNG specification:
+    within each byte the first (leftmost) pixel occupies
+    the most significant bits, and so on;
+    when the row does not fill a whole number of bytes
+    the remaining bits of the last byte are set to zero.
+    `unpack_bits` performs the inverse operation.
+
+    `bitdepth` must be 1, 2, or 4;
+    every value must fit in `bitdepth` bits.
     """
 
     assert bitdepth < 8
     assert 8 % bitdepth == 0
 
     # samples per byte
-    spb = int(8 / bitdepth)
+    spb = 8 // bitdepth
 
     def make_byte(block):
         """Take a block of (2, 4, or 8) values,
@@ -990,15 +1003,40 @@ def pack_rows(rows, bitdepth):
 
     for row in rows:
         a = bytearray(row)
-        # Adding padding bytes so we can group into a whole
+        # Add zero padding values so we can group into a whole
         # number of spb-tuples.
-        n = float(len(a))
-        extra = math.ceil(n / spb) * spb - n
-        a.extend([0] * int(extra))
+        extra = -len(a) % spb
+        a.extend([0] * extra)
         # Pack into bytes.
         # Each block is the samples for one byte.
         blocks = group(a, spb)
         yield bytearray(make_byte(block) for block in blocks)
+
+
+def unpack_bits(bs, bitdepth, width):
+    """Unpack a row of packed bytes into a row of values.
+
+    This is the inverse of the packing performed by `pack_rows`,
+    following the PNG specification:
+    the first value is taken from the most significant bits
+    of the first byte, and so on.
+    Exactly `width` values are returned;
+    any padding bits left over at the end of the row are discarded.
+
+    `bitdepth` must be 1, 2, or 4.
+    """
+
+    assert bitdepth < 8
+    assert 8 % bitdepth == 0
+
+    # Samples per byte
+    spb = 8 // bitdepth
+    mask = 2**bitdepth - 1
+    shifts = [bitdepth * i for i in reversed(range(spb))]
+    out = bytearray()
+    for o in bs:
+        out.extend(mask & (o >> i) for i in shifts)
+    return out[:width]
 
 
 def unpack_rows(rows):
@@ -1560,15 +1598,10 @@ class Reader:
         assert self.bitdepth < 8
         if width is None:
             width = self.width
-        # Samples per byte
-        spb = 8 // self.bitdepth
-        out = bytearray()
-        mask = 2**self.bitdepth - 1
-        shifts = [self.bitdepth * i
-                  for i in reversed(list(range(spb)))]
-        for o in bs:
-            out.extend([mask & (o >> i) for i in shifts])
-        return out[:width]
+        # Number of values is `width` times the number of channels;
+        # but bit depths below 8 only occur for
+        # greyscale and palette images, which have a single channel.
+        return unpack_bits(bs, self.bitdepth, width)
 
     def _iter_straight_packed(self, byte_blocks):
         """Iterator that undoes the effect of filtering;
