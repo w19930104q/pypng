@@ -29,9 +29,11 @@ def read_pam_header(infile):
             break
         if not line:
             raise EOFError("PAM ended prematurely")
-        if line[0] == b"#":
+        if line.startswith(b"#"):
             continue
         line = line.split(None, 1)
+        if len(line) != 2:
+            raise png.Error("PAM header line %r has no value" % line[0])
         key = line[0]
         if key not in header:
             header[key] = line[1]
@@ -51,6 +53,28 @@ def read_pam_header(infile):
         if x <= 0:
             raise png.Error(required_str + " must all be positive integers")
         result.append(x)
+
+    depth = result[2]
+
+    # The DEPTH alone determines how the channels are interpreted
+    # (greyscale, greyscale+alpha, RGB, RGB+alpha).
+    # A TUPLTYPE that names one of the standard visual tuple types
+    # but is inconsistent with the DEPTH would silently cross
+    # the greyscale and alpha semantics, so reject it.
+    # Unrecognised tuple types are ignored (as before).
+    tupltype_depth = {
+        b"BLACKANDWHITE": 1,
+        b"GRAYSCALE": 1,
+        b"GRAYSCALE_ALPHA": 2,
+        b"RGB": 3,
+        b"RGB_ALPHA": 4,
+    }
+    tupltype = header.get(b"TUPLTYPE")
+    if tupltype in tupltype_depth and tupltype_depth[tupltype] != depth:
+        raise png.Error(
+            "PAM TUPLTYPE %s is inconsistent with DEPTH %d"
+            % (tupltype.decode("ascii"), depth)
+        )
 
     return (b"P7",) + tuple(result)
 
@@ -161,7 +185,7 @@ def read_pnm_header(infile):
     if magic in pbm:
         # synthesize a MAXVAL
         header.append(1)
-    depth = (1, 3)[magic == b"P6"]
+    depth = (1, 3)[magic in (b"P3", b"P6")]
     return header[0], header[1], header[2], depth, header[3]
 
 
@@ -309,7 +333,7 @@ def main(argv=None):
     # Encode PNM to PNG
     format, width, height, depth, maxval = read_pnm_header(infile)
 
-    ok_formats = (b"P2", b"P5", b"P6", b"P7")
+    ok_formats = (b"P2", b"P3", b"P5", b"P6", b"P7")
     if format not in ok_formats:
         raise NotImplementedError("file format %s not supported" % format)
 
@@ -320,7 +344,13 @@ def main(argv=None):
     # - they correspond to 1, 2, 3, 4 channels respectively.
     # We use the number of channels in the source image to
     # determine which one we have.
-    # We ignore the NetPBM image type and the PAM TUPLTYPE.
+    # Any other depth is unsupported and must fail explicitly,
+    # rather than silently misinterpreting the channels.
+    # (The PAM TUPLTYPE, when present and recognised, has already
+    # been checked for consistency with the depth;
+    # see read_pam_header.)
+    if depth not in (1, 2, 3, 4):
+        raise NotImplementedError("image depth %d not supported" % depth)
     greyscale = depth <= 2
     pamalpha = depth in (2, 4)
     supported = [2 ** x - 1 for x in range(1, 17)]

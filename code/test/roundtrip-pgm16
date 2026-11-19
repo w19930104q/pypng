@@ -1,0 +1,19 @@
+#!/bin/sh
+
+# Test that a 16-bit binary PGM (P5) file round-trips:
+# PGM -> PNG -> PGM is byte-for-byte identical.
+
+PATH=${PWD%code*}code:$PATH
+
+t=$(mktemp)
+trap 'rm -f "$t"' EXIT
+
+{
+  printf 'P5 2 2 65535\n'
+  # Samples 0, 1, 65535, 32768; most significant byte first.
+  printf '\000\000\000\001\377\377\200\000'
+} > "$t"
+
+pripamtopng "$t" |
+pripngtopam - |
+cmp - "$t"

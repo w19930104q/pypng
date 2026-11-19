@@ -1,0 +1,22 @@
+#!/bin/sh
+
+# Test that an RGB+alpha PAM file round-trips:
+# PAM -> PNG -> PAM is byte-for-byte identical,
+# and the alpha channel is preserved as alpha.
+
+PATH=${PWD%code*}code:$PATH
+
+t=$(mktemp)
+trap 'rm -f "$t"' EXIT
+
+{
+  printf 'P7\n'
+  printf 'WIDTH 2\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\n'
+  printf 'TUPLTYPE RGB_ALPHA\n'
+  printf 'ENDHDR\n'
+  printf '\377\0\0\377\0\377\0\170'
+} > "$t"
+
+pripamtopng "$t" |
+pripngtopam - |
+cmp - "$t"

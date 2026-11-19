@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# Test that a binary PGM (P5) file round-trips:
+# PGM -> PNG -> PGM is byte-for-byte identical.
+
+PATH=${PWD%code*}code:$PATH
+
+t=$(mktemp)
+trap 'rm -f "$t"' EXIT
+
+{
+  printf 'P5 4 2 255\n'
+  printf '\000\001\002\003\004\377\200\171'
+} > "$t"
+
+pripamtopng "$t" |
+pripngtopam - |
+cmp - "$t"

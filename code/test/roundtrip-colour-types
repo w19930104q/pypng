@@ -1,0 +1,31 @@
+#!/bin/sh
+
+# Test that PNG -> PNM -> PNG preserves the colour semantics:
+# greyscale stays greyscale (no alpha is invented),
+# greyscale+alpha stays greyscale+alpha,
+# RGB stays RGB, and RGB+alpha stays RGB+alpha.
+
+PATH=${PWD%code*}code:$PATH
+
+# Each check greps the IHDR of the round-tripped PNG:
+# width=height=32 (00000020), then bit depth, then colour type.
+
+python -m pngsuite basn0g08 |
+pripngtopam - | pripamtopng - |
+pripnglsch - |
+grep -q 'IHDR.*00000020000000200800000000' || exit 1
+
+python -m pngsuite basn4a16 |
+pripngtopam - | pripamtopng - |
+pripnglsch - |
+grep -q 'IHDR.*00000020000000201004000000' || exit 1
+
+python -m pngsuite basn2c08 |
+pripngtopam - | pripamtopng - |
+pripnglsch - |
+grep -q 'IHDR.*00000020000000200802000000' || exit 1
+
+python -m pngsuite basn6a08 |
+pripngtopam - | pripamtopng - |
+pripnglsch - |
+grep -q 'IHDR.*00000020000000200806000000'

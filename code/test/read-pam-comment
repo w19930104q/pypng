@@ -1,0 +1,19 @@
+#!/bin/sh
+
+# Test that pripamtopng skips comment lines in a PAM header,
+# both "# comment" and "#comment" forms.
+
+PATH=${PWD%code*}code:$PATH
+
+{
+  printf 'P7\n'
+  printf '# a comment\n'
+  printf 'WIDTH 1\n'
+  printf '#comment without space\n'
+  printf 'HEIGHT 1\nDEPTH 1\nMAXVAL 255\nTUPLTYPE GRAYSCALE\n'
+  printf 'ENDHDR\n'
+  printf '\310'
+} |
+pripamtopng - |
+pripnglsch - |
+grep -q 'IHDR.*00000001000000010800000000'

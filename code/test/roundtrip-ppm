@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# Test that a binary PPM (P6) file round-trips:
+# PPM -> PNG -> PPM is byte-for-byte identical.
+
+PATH=${PWD%code*}code:$PATH
+
+t=$(mktemp)
+trap 'rm -f "$t"' EXIT
+
+{
+  printf 'P6 2 1 255\n'
+  printf '\377\0\0\0\377\0'
+} > "$t"
+
+pripamtopng "$t" |
+pripngtopam - |
+cmp - "$t"

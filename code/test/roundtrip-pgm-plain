@@ -1,0 +1,16 @@
+#!/bin/sh
+
+# Test that a plain PGM (P2) file round-trips:
+# P2 -> PNG -> P2 (using pripngtopam --plain)
+# is byte-for-byte identical.
+
+PATH=${PWD%code*}code:$PATH
+
+t=$(mktemp)
+trap 'rm -f "$t"' EXIT
+
+printf 'P2 3 1 255\n0 128 255\n' > "$t"
+
+pripamtopng "$t" |
+pripngtopam --plain - |
+cmp - "$t"

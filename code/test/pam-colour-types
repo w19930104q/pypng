@@ -1,0 +1,31 @@
+#!/bin/sh
+
+# Test that pripamtopng maps each PAM visual tuple type to the
+# corresponding PNG colour type:
+# GRAYSCALE -> 0, GRAYSCALE_ALPHA -> 4, RGB -> 2, RGB_ALPHA -> 6.
+
+PATH=${PWD%code*}code:$PATH
+
+check () {
+  # depth tupltype nsamples expected-colour-type
+  {
+    printf 'P7\n'
+    printf 'WIDTH 2\nHEIGHT 1\nDEPTH %s\nMAXVAL 255\n' "$1"
+    printf 'TUPLTYPE %s\n' "$2"
+    printf 'ENDHDR\n'
+    # Emit $3 zero bytes of raster.
+    i=0
+    while [ $i -lt $3 ]; do
+      printf '\0'
+      i=$((i + 1))
+    done
+  } |
+  pripamtopng - |
+  pripnglsch - |
+  grep -q "IHDR.*0000000200000001080$4000000"
+}
+
+check 1 GRAYSCALE 2 0 &&
+check 2 GRAYSCALE_ALPHA 4 4 &&
+check 3 RGB 6 2 &&
+check 4 RGB_ALPHA 8 6

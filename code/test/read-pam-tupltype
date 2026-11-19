@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# Test that pripamtopng fails explicitly when the PAM TUPLTYPE
+# is inconsistent with the DEPTH (which would otherwise silently
+# cross the greyscale and alpha semantics).
+
+PATH=${PWD%code*}code:$PATH
+
+for tupl in '2 GRAYSCALE' '1 GRAYSCALE_ALPHA' '3 RGB_ALPHA' '4 RGB'; do
+  set -- $tupl
+  {
+    printf 'P7\n'
+    printf 'WIDTH 1\nHEIGHT 1\nDEPTH %s\nMAXVAL 255\n' "$1"
+    printf 'TUPLTYPE %s\n' "$2"
+    printf 'ENDHDR\n'
+    printf '\0\0\0\0\0\0\0\0'
+  } |
+  pripamtopng - 2>/dev/null
+  if [ $? -eq 0 ]; then
+    echo "DEPTH $1 TUPLTYPE $2 should have failed" >&2
+    exit 1
+  fi
+done

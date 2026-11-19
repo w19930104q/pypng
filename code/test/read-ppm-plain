@@ -1,0 +1,11 @@
+#!/bin/sh
+
+# Test that pripamtopng can read a plain (P3) PPM file,
+# such as produced by pripngtopam --plain.
+
+PATH=${PWD%code*}code:$PATH
+
+printf 'P3 2 1 255\n255 0 0 0 255 0\n' |
+pripamtopng - |
+pripnglsch - |
+grep -q 'IHDR.*00000002000000010802000000'

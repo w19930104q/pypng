@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# Test that for every basic pngsuite image (all colour types
+# and bit depths), PNG -> PNM -> PNG -> PNM is stable:
+# the second PNM is byte-for-byte identical to the first,
+# which implies the round trip is pixel-for-pixel faithful.
+
+PATH=${PWD%code*}code:$PATH
+
+t=$(mktemp)
+trap 'rm -f "$t"' EXIT
+
+for img in basn0g01 basn0g02 basn0g04 basn0g08 basn0g16 \
+           basn2c08 basn2c16 basn3p04 basn4a16 basn6a08 basn6a16 \
+           basi0g08 basi2c08 basi6a08; do
+  python -m pngsuite "$img" | pripngtopam - > "$t"
+  pripamtopng "$t" | pripngtopam - | cmp - "$t" || exit 1
+done
