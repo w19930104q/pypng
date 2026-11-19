@@ -333,6 +333,33 @@ class Test(unittest.TestCase):
         w = png.Writer(3, 2, interlace=True, greyscale=True)
         w.write_array(f, bytes([0x55, 0xAA, 0xFF, 0xAA, 0x55, 0x00]))
 
+    def test_interlace_roundtrip_extreme_sizes(self):
+        """Interlaced roundtrip at extreme sizes.
+        One row, one column, and other extreme aspect ratios;
+        every width/height combination should survive
+        a write/read roundtrip pixel-for-pixel.
+        """
+
+        def rows_for(width, height):
+            return [
+                [(x * 3 + y * 5) % 256 for x in range(width)]
+                for y in range(height)
+            ]
+
+        sizes = [(1, 1), (1, 2), (2, 1), (1, 7), (7, 1), (1, 8), (8, 1)]
+        # Every combination of small widths and heights.
+        sizes += [(w, h) for w in range(1, 10) for h in range(1, 10)]
+        # Extreme aspect ratios.
+        sizes += [(1, 3000), (3000, 1), (2, 1999), (1999, 2)]
+        for width, height in sizes:
+            with self.subTest(size=(width, height)):
+                rows = rows_for(width, height)
+                f = BytesIO()
+                png.Writer(width, height, greyscale=True,
+                           interlace=True).write(f, rows)
+                out = png.Reader(bytes=f.getvalue()).read()[2]
+                self.assertEqual([list(row) for row in out], rows)
+
     def test_palette_info(self):
         """Test that a palette PNG returns the palette in info."""
         r = png.Reader(bytes=pngsuite.basn3p04)

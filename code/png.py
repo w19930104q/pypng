@@ -897,9 +897,12 @@ class Writer:
                 # We have to step by xstep,
                 # which we can do one plane at a time
                 # using the step in Python slices.
-                row = array(fmt)
-                # There's no easier way to set the length of an array
-                row.extend(pixels[0:reduced_row_len])
+                # Allocate a zero-filled row of the right length;
+                # every element is overwritten below.
+                # (Avoids copying `reduced_row_len` image values
+                # merely to size the array,
+                # which is significant for extreme widths.)
+                row = array(fmt, [0]) * reduced_row_len
                 offset = y * vpr + x * self.planes
                 end_offset = (y + 1) * vpr
                 skip = self.planes * xstep
@@ -1470,7 +1473,7 @@ class Reader:
         # first line 'up' is the same as 'null', 'paeth' is the same
         # as 'sub', with only 'average' requiring any special case.
         if not previous:
-            previous = bytearray([0] * len(scanline))
+            previous = bytearray(len(scanline))
 
         # Call appropriate filter algorithm.  Note that 0 has already
         # been dealt with.
@@ -1496,10 +1499,13 @@ class Reader:
         # Interleaving writes to the output array randomly
         # (well, not quite), so the entire output array must be in memory.
         # Make a result array, and make it big enough.
+        # Allocate directly (without an intermediate list);
+        # for extreme image sizes a temporary list of `vpi` elements
+        # would need about 8 bytes per pixel and could exhaust memory.
         if self.bitdepth > 8:
-            a = array('H', [0] * vpi)
+            a = array('H', [0]) * vpi
         else:
-            a = bytearray([0] * vpi)
+            a = bytearray(vpi)
         source_offset = 0
 
         for lines in adam7_generate(self.width, self.height):
