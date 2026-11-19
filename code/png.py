@@ -187,7 +187,9 @@ import zlib
 from array import array
 
 
-__all__ = ['Image', 'Reader', 'Writer', 'write_chunks', 'from_array']
+__all__ = ['Image', 'Reader', 'Writer', 'write_chunks', 'from_array',
+           'palette_to_direct', 'direct_to_palette',
+           'nearest_palette_colour']
 
 
 # The PNG signature.
@@ -1264,6 +1266,340 @@ def from_array(a, mode=None, info={}):
 
 # So that refugee's from PIL feel more at home.  Not documented.
 fromarray = from_array
+
+
+# The largest number of entries that a PNG ``PLTE`` chunk may hold.
+# https://www.w3.org/TR/PNG/#11PLTE
+MAX_PALETTE = 256
+
+
+def _palette_bitdepth(n):
+    """Return the smallest legal PNG index bit depth (1, 2, 4, or 8)
+    that can address a palette of *n* entries.
+    """
+
+    if n <= 2:
+        return 1
+    if n <= 4:
+        return 2
+    if n <= 16:
+        return 4
+    return 8
+
+
+def _palette_output_info(info, palette):
+    """Build the *info* dictionary that describes a palette
+    (colour type 3) image made from the direct-image dictionary *info*.
+
+    Metadata that has no defined meaning for a palette image, or that
+    cannot be carried over unchanged, is dropped rather than passed to
+    the :class:`Writer` in a contradictory state.  In particular
+    interlacing is dropped because the generated index rows are not
+    interlaced (carrying it over would scramble the scanline order).
+    """
+
+    out = {}
+    # Only carry over metadata that is both meaningful for colour type 3
+    # and layout-independent.
+    for key in ('compression', 'chunk_limit'):
+        if key in info:
+            out[key] = info[key]
+
+    n = len(palette)
+    out.update(
+        size=info['size'],
+        greyscale=False,
+        alpha=False,
+        bitdepth=_palette_bitdepth(n),
+        palette=palette,
+        colormap=True,
+        planes=1,
+    )
+    return out
+
+
+def _check_direct_8bit(info):
+    """Validate that *info* describes an 8-bit RGB or RGBA (direct,
+    non-palette) image, the only inputs the palette conversion accepts.
+    """
+
+    if info.get('colormap') or 'palette' in info:
+        raise ProtocolError(
+            "source image already uses a palette; "
+            "there is nothing to convert")
+    if info.get('greyscale'):
+        raise ProtocolError(
+            "greyscale images cannot be converted to a colour palette")
+    if info.get('bitdepth') != 8:
+        raise ProtocolError(
+            "only 8-bit per channel images can be converted to a palette"
+            " (bitdepth is %r)" % info.get('bitdepth'))
+    planes = info.get('planes')
+    if planes not in (3, 4):
+        raise ProtocolError(
+            "source image must have 3 (RGB) or 4 (RGBA) planes, not %r"
+            % planes)
+
+
+def _check_max_colors(max_colors):
+    if not is_natural(max_colors) or not (1 <= max_colors <= MAX_PALETTE):
+        raise ProtocolError(
+            "max_colors must be an integer between 1 and %d" % MAX_PALETTE)
+
+
+def palette_to_direct(width, height, rows, info, sbit=None):
+    """Convert a palette (colour type 3) image to a direct RGB or RGBA
+    image.
+
+    This is the exact, lossless inverse of :func:`direct_to_palette`
+    running in its default (non-quantizing) mode.  Each palette index in
+    *rows* is replaced by the colour stored in the palette, so the
+    returned pixel values represent the colour directly and no colour
+    information is lost.
+
+    Arguments mirror the values returned by :meth:`Reader.read`:
+    *width*, *height*, a sequence of *rows* (of palette indexes), and the
+    *info* dictionary which must contain a ``palette`` entry as produced
+    by the :class:`Reader`.
+
+    The optional *sbit* argument mirrors :attr:`Reader.sbit`.  When the
+    source PNG carried an ``sBIT`` chunk (the significant-bits
+    declaration), pass its raw byte string here and the expanded sample
+    values are reduced to that precision, exactly as
+    :meth:`Reader.asDirect` does; the returned ``bitdepth`` is lowered to
+    match.  When *sbit* is ``None`` the full 8-bit palette values are
+    returned unchanged.
+
+    Returns the usual 4-tuple ``(width, height, rows, info)`` where the
+    rows yield RGB values, or RGBA values when the palette carries
+    transparency.  The returned *info* describes the direct image (so
+    ``palette`` and ``colormap`` are removed and ``planes`` is 3 or 4).
+    """
+
+    palette = info.get('palette')
+    if palette is None:
+        raise ProtocolError(
+            "info has no palette; nothing to convert to a direct image")
+
+    # Normalise every entry to the same arity.  A palette that carries
+    # any alpha becomes a fully RGBA palette, with opaque alpha 255
+    # filled in for the plain RGB entries.
+    if any(len(entry) == 4 for entry in palette):
+        table = [
+            entry if len(entry) == 4
+            else (entry[0], entry[1], entry[2], 255)
+            for entry in palette
+        ]
+        planes = 4
+    else:
+        table = [tuple(entry) for entry in palette]
+        planes = 3
+
+    # An sBIT chunk declares how many of the 8 bits per palette sample
+    # are significant.  Honour it the same way Reader.asDirect does.
+    shift = 0
+    out_bitdepth = 8
+    if sbit:
+        significant = struct.unpack('%dB' % len(sbit), sbit)
+        target = max(significant)
+        if target > 8:
+            raise Error('sBIT chunk %r exceeds 8-bit palette depth' %
+                        (significant,))
+        if min(significant) <= 0:
+            raise Error('sBIT chunk %r has a 0-entry' % (significant,))
+        shift = 8 - target
+        out_bitdepth = target
+
+    def expand():
+        for row in rows:
+            values = itertools.chain.from_iterable(
+                table[index] for index in row)
+            if shift:
+                values = (v >> shift for v in values)
+            yield array('B', values)
+
+    out = dict(info)
+    out.pop('palette', None)
+    out.pop('colormap', None)
+    # A palette image's transparent/background colours are index based
+    # and do not apply to the expanded direct pixels.
+    out.pop('transparent', None)
+    out.pop('background', None)
+    out.update(
+        greyscale=False,
+        alpha=(planes == 4),
+        bitdepth=out_bitdepth,
+        planes=planes,
+    )
+    return width, height, expand(), out
+
+
+def _median_cut(colors, max_colors):
+    """Median-cut colour quantisation.
+
+    *colors* is a list of ``(count, (r, g, b[, a]))`` pairs (one per
+    distinct source colour).  Returns a list of representative palette
+    colours, no more than *max_colors* entries long.  Deterministic:
+    ties are broken by channel order and sorted values.
+    """
+
+    # Each box is a list of (count, colour) pairs.  Start with one box
+    # holding every distinct colour.
+    boxes = [list(colors)]
+    while len(boxes) < max_colors:
+        # Choose the box with the greatest spread along any channel to
+        # split next; ties are resolved by position for determinism.
+        target = None
+        target_spread = None
+        target_axis = 0
+        for position, box in enumerate(boxes):
+            if len(box) < 2:
+                continue
+            channels = len(box[0][1])
+            for axis in range(channels):
+                values = [colour[axis] for _, colour in box]
+                spread = max(values) - min(values)
+                if target is None or spread > target_spread:
+                    target = position
+                    target_spread = spread
+                    target_axis = axis
+        if target is None:
+            # Every remaining box holds a single colour: no further
+            # distinct colours can be produced.
+            break
+
+        box = boxes.pop(target)
+        box.sort(key=lambda item: item[1][target_axis])
+        middle = len(box) // 2
+        boxes.append(box[:middle])
+        boxes.append(box[middle:])
+
+    palette = []
+    for box in boxes:
+        total = sum(count for count, _ in box)
+        channels = len(box[0][1])
+        representative = []
+        for axis in range(channels):
+            mean = sum(count * colour[axis]
+                       for count, colour in box) / total
+            representative.append(int(round(mean)))
+        palette.append(tuple(representative))
+    return palette
+
+
+def nearest_palette_colour(colour, palette):
+    """Return the index of the palette entry closest to *colour*.
+
+    Distance is plain Euclidean distance over all channels; on a tie the
+    earliest palette entry wins, making the choice deterministic.
+    The squared distance is returned alongside the index so callers can
+    report the colour error without recomputing it.
+    """
+
+    best_index = 0
+    best_distance = None
+    for index, entry in enumerate(palette):
+        distance = sum((c - p) ** 2 for c, p in zip(colour, entry))
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_index = index
+    return best_index, best_distance
+
+
+def direct_to_palette(width, height, rows, info,
+                      max_colors=MAX_PALETTE, quantize=False):
+    """Convert a direct 8-bit RGB or RGBA image to a palette
+    (colour type 3) image.
+
+    By default (*quantize* false) the conversion is **exact**: the
+    palette is built from the distinct colours that actually occur, and
+    every pixel is mapped to its identical colour.  If the image
+    contains more distinct colours than the palette can hold an
+    exception is raised rather than silently substituting a wrong
+    colour.  The capacity is the smaller of *max_colors* and the PNG
+    limit of 256 entries.
+
+    When *quantize* is true a palette of at most *max_colors* colours is
+    generated with median-cut quantisation and each pixel is mapped to
+    its nearest palette colour.  This path can change colours, so the
+    colour difference is measured and reported.
+
+    Returns a 5-tuple ``(width, height, rows, info, stats)``.  *rows*
+    yield palette indexes; *info* is set up for :class:`Writer` (it
+    includes the generated ``palette`` and an index ``bitdepth`` of 1,
+    2, 4, or 8).  *stats* is a dictionary with the keys:
+
+    ``quantized``
+      true when colours were approximated, false for an exact conversion.
+    ``colors``
+      number of entries in the resulting palette.
+    ``max_error``
+      largest per-pixel colour error, Euclidean distance over the
+      channels (0 for an exact conversion).
+    ``mean_squared_error``
+      mean squared Euclidean error, averaged over all pixels.
+    """
+
+    _check_direct_8bit(info)
+    _check_max_colors(max_colors)
+
+    planes = info['planes']
+
+    # Materialise the pixels grouped into colours; both the exact and
+    # the median-cut paths need the distinct colour set, and a generator
+    # can only be consumed once.
+    materialised = [list(group(row, planes)) for row in rows]
+
+    counts = collections.OrderedDict()
+    for row in materialised:
+        for colour in row:
+            counts[colour] = counts.get(colour, 0) + 1
+    # _median_cut expects (count, colour) pairs.
+    distinct = [(count, colour) for colour, count in counts.items()]
+
+    if not quantize and len(distinct) > max_colors:
+        raise ProtocolError(
+            "image has %d distinct colours but the palette can hold at "
+            "most %d; enable quantization to reduce the number of colours"
+            % (len(distinct), max_colors))
+
+    if quantize:
+        palette = _median_cut(distinct, max_colors)
+    else:
+        # Exact palette, in first-occurrence order.
+        palette = [colour for _, colour in distinct]
+
+    # Index each colour to its palette slot.
+    inverse = {colour: index for index, colour in enumerate(palette)}
+
+    max_error = 0
+    squared_error_sum = 0
+    pixel_count = 0
+    indexed = []
+    for row in materialised:
+        index_row = array('B')
+        for colour in row:
+            if quantize:
+                index, squared = nearest_palette_colour(colour, palette)
+            else:
+                index = inverse[colour]
+                squared = 0
+            index_row.append(index)
+            squared_error_sum += squared
+            pixel_count += 1
+            max_error = max(max_error, math.sqrt(squared))
+        indexed.append(index_row)
+
+    stats = {
+        'quantized': bool(quantize and len(distinct) > len(palette)),
+        'colors': len(palette),
+        'max_error': max_error,
+        'mean_squared_error': (
+            squared_error_sum / pixel_count if pixel_count else 0.0),
+    }
+
+    out = _palette_output_info(info, palette)
+    return width, height, indexed, out, stats
 
 
 class Image:

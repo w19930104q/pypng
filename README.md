@@ -68,6 +68,23 @@ your current directory:
 
 Development moved to gitlab: https://gitlab.com/drj11/pypng
 
+New `png.direct_to_palette` and `png.palette_to_direct` functions give
+palette (colour type 3) and direct (RGB/RGBA) images a single, explicit
+conversion semantics.
+`png.direct_to_palette` builds a palette from the distinct colours in an
+8-bit image; by default it is exact and raises `png.ProtocolError` when
+there are more distinct colours than the palette can hold, rather than
+silently substituting a wrong colour.
+Pass `quantize=True` to reduce the colour count with median-cut
+quantisation (bounded by `max_colors`, at most 256); the colour error is
+returned in the result statistics.
+`png.palette_to_direct` expands palette indexes back into RGB or RGBA,
+optionally honouring an `sBIT` chunk the same way `Reader.asDirect`
+does.
+The `pripalpng` tool uses these functions: it now fails cleanly when a
+colour cannot be represented, and gains `--quantize` and `--max-colors`
+options.
+
 If you pass an empty file to PyPNG
 it now raises the builtin Python exception `EOFError`.
 This should make it easier to diagnose _empty file_ problems separately

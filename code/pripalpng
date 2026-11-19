@@ -5,33 +5,13 @@
 """Convert to Palette PNG (without changing colours)"""
 
 import argparse
-import collections
-
-# https://docs.python.org/2.7/library/io.html
-import io
-import string
-import zlib
 
 # Local module.
 import png
 
 
-def make_inverse_palette(rows, channels):
-    """
-    The inverse palette maps from tuple to palette index.
-    """
-
-    palette = {}
-
-    for row in rows:
-        for pixel in png.group(row, channels):
-            if pixel in palette:
-                continue
-            palette[pixel] = len(palette)
-    return palette
-
-
-def palette_convert(out, inp, palette_file):
+def palette_convert(out, inp, palette_file,
+                    quantize=False, max_colors=png.MAX_PALETTE):
     """
     Convert PNG image in `inp` to use a palette, colour type 3,
     and write converted image to `out`.
@@ -39,40 +19,90 @@ def palette_convert(out, inp, palette_file):
     `palette_file` is a file descriptor for the palette to use.
 
     If `palette_file` is None, then `inp` is used as the palette.
+
+    By default the conversion is exact: every source colour must be
+    representable.  When an image has more distinct colours than the
+    palette can hold, `png.ProtocolError` is raised instead of silently
+    substituting a wrong colour.  Pass `quantize=True` to reduce the
+    number of colours (median cut) so that the palette capacity is
+    respected; in that case colours may change, but the resulting
+    palette never holds more than `max_colors` entries.
     """
 
-    if palette_file is None:
+    own_palette = palette_file is None
+    if own_palette:
+        # After this swap the single input file is held in
+        # palette_file, and inp being None signals that the palette
+        # is derived from that same file.
         inp, palette_file = palette_file, inp
 
-    reader = png.Reader(file=palette_file)
-    w, h, rows, info = asRGBorA8(reader)
-    channels = info["planes"]
-    if not inp:
-        rows = list(rows)
+    if own_palette:
+        reader = png.Reader(file=palette_file)
+        width, height, rows, info = asRGBorA8(reader)
+        width, height, index_rows, pal_info, stats = png.direct_to_palette(
+            width, height, rows, info,
+            max_colors=max_colors, quantize=quantize)
+        # Match the historical output: an 8-bit index depth.
+        pal_info["bitdepth"] = 8
+        writer = png.Writer(**pal_info)
+        writer.write(out, index_rows)
+        return stats
 
-    palette_map = make_inverse_palette(rows, channels)
+    # A palette is supplied separately; its distinct colours define the
+    # entries and the input pixels are mapped onto them.
+    palette_reader = png.Reader(file=palette_file)
+    _, _, palette_rows, palette_info = asRGBorA8(palette_reader)
+    channels = palette_info["planes"]
+    palette = []
+    seen = set()
+    for row in palette_rows:
+        for pixel in png.group(row, channels):
+            if pixel not in seen:
+                seen.add(pixel)
+                palette.append(pixel)
 
-    if inp:
-        reader = png.Reader(file=inp)
-        w, h, rows, info = asRGBorA8(reader)
-        channels = info["planes"]
+    if len(palette) > png.MAX_PALETTE:
+        raise png.ProtocolError(
+            "supplied palette has %d entries but a PNG palette can hold "
+            "at most %d" % (len(palette), png.MAX_PALETTE))
 
-    # Default for colours not in palette is to use last entry.
-    last = len(palette_map) - 1
+    reader = png.Reader(file=inp)
+    width, height, rows, info = asRGBorA8(reader)
+    if info["planes"] != channels:
+        raise png.ProtocolError(
+            "input image has %d channels but the palette has %d"
+            % (info["planes"], channels))
 
-    def map_pixel(p):
-        return palette_map.get(p, last)
+    inverse = {colour: index for index, colour in enumerate(palette)}
 
     def convert_rows():
         for row in rows:
-            yield [map_pixel(p) for p in png.group(row, channels)]
+            index_row = []
+            for pixel in png.group(row, channels):
+                if pixel in inverse:
+                    index_row.append(inverse[pixel])
+                elif quantize:
+                    index, _ = png.nearest_palette_colour(pixel, palette)
+                    index_row.append(index)
+                else:
+                    raise png.ProtocolError(
+                        "colour %r is not present in the supplied "
+                        "palette; use --quantize to approximate it"
+                        % (pixel,))
+            yield index_row
 
-    # Make a palette by sorting the pixels according to their index.
-    palette = sorted(palette_map.keys(), key=palette_map.get)
-    pal_info = dict(size=info["size"], palette=palette)
-
-    w = png.Writer(**pal_info)
-    w.write(out, convert_rows())
+    pal_info = dict(
+        size=info["size"],
+        greyscale=False,
+        alpha=False,
+        bitdepth=8,
+        palette=palette,
+        colormap=True,
+        planes=1,
+    )
+    writer = png.Writer(**pal_info)
+    writer.write(out, convert_rows())
+    return None
 
 
 def asRGBorA8(reader):
@@ -89,7 +119,6 @@ def asRGBorA8(reader):
 
 def main(argv=None):
     import sys
-    import re
 
     if argv is None:
         argv = sys.argv
@@ -99,13 +128,31 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--palette", type=png.cli_open)
     parser.add_argument(
+        "--quantize", action="store_true",
+        help="reduce the number of colours when the palette capacity "
+             "would otherwise be exceeded")
+    parser.add_argument(
+        "--max-colors", type=int, default=png.MAX_PALETTE,
+        help="maximum number of palette entries when quantizing "
+             "(1..%d)" % png.MAX_PALETTE)
+    parser.add_argument(
         "input", nargs="?", default="-", type=png.cli_open, metavar="PNG"
     )
 
     args = parser.parse_args(argv)
 
-    palette_convert(png.binary_stdout(), args.input, args.palette)
+    try:
+        palette_convert(
+            png.binary_stdout(), args.input, args.palette,
+            quantize=args.quantize, max_colors=args.max_colors)
+    except png.Error as error:
+        # Convert a library error into a clean CLI failure rather than
+        # a raw traceback.
+        sys.stderr.write("%s: %s\n" % (parser.prog, error))
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(main())

@@ -18,6 +18,7 @@ import glob
 # https://docs.python.org/3.7/library/io.html
 import io
 import itertools
+import math
 import os
 import sys
 
@@ -1287,6 +1288,237 @@ def read_modify_chunks(modify_chunk):
 
 def group(s, n):
     return list(zip(*[iter(s)] * n))
+
+
+class TestPaletteConversion(unittest.TestCase):
+    """Tests for the explicit palette <-> direct colour conversion
+    functions and for quantized round trips.
+    """
+
+    def rgb_info(self, width, height):
+        return {
+            "size": (width, height),
+            "planes": 3,
+            "bitdepth": 8,
+            "greyscale": False,
+            "alpha": False,
+        }
+
+    def rgba_info(self, width, height):
+        info = self.rgb_info(width, height)
+        info["planes"] = 4
+        info["alpha"] = True
+        return info
+
+    def wide_rows(self, n):
+        """A single row holding *n* guaranteed-distinct RGB pixels."""
+        return [[channel
+                 for i in range(n)
+                 for channel in (i % 64, (i // 64) % 64, i // 4096)]]
+
+    def write_and_reread(self, rows, info):
+        o = BytesIO()
+        png.Writer(**info).write(o, rows)
+        o.seek(0)
+        return png.Reader(file=o).read()
+
+    def test_direct_to_palette_exact(self):
+        """An image whose colours fit is converted exactly."""
+        rows = [[255, 0, 0, 0, 255, 0],
+                [0, 0, 255, 255, 0, 0]]
+        _, _, idx, info, stats = png.direct_to_palette(
+            2, 2, rows, self.rgb_info(2, 2))
+        self.assertFalse(stats["quantized"])
+        self.assertEqual(stats["max_error"], 0)
+        self.assertEqual(stats["mean_squared_error"], 0.0)
+        # Four distinct colours -> 2 bit indexes.
+        self.assertEqual(info["bitdepth"], 2)
+        self.assertEqual(stats["colors"], len(info["palette"]))
+        self.assertEqual([list(r) for r in idx],
+                         [[0, 1], [2, 0]])
+
+    def test_exact_roundtrip_rgb(self):
+        """Palette then direct conversion restores RGB pixels exactly."""
+        rows = [[255, 0, 0, 0, 255, 0, 0, 0, 255],
+                [10, 20, 30, 10, 20, 30, 255, 255, 255]]
+        _, _, idx, info, _ = png.direct_to_palette(
+            3, 2, rows, self.rgb_info(3, 2))
+        rw, rh, pr, pinfo = self.write_and_reread(idx, info)
+        _, _, drows, dinfo = png.palette_to_direct(rw, rh, pr, pinfo)
+        self.assertEqual([list(r) for r in drows], rows)
+        self.assertNotIn("palette", dinfo)
+        self.assertFalse(dinfo.get("colormap"))
+        self.assertEqual(dinfo["planes"], 3)
+        self.assertFalse(dinfo["alpha"])
+        self.assertEqual(dinfo["bitdepth"], 8)
+
+    def test_exact_roundtrip_rgba(self):
+        """Semi-transparent palette entries survive a round trip."""
+        rows = [[255, 0, 0, 128, 0, 255, 0, 255],
+                [0, 0, 255, 0, 255, 0, 0, 128]]
+        _, _, idx, info, _ = png.direct_to_palette(
+            2, 2, rows, self.rgba_info(2, 2))
+        rw, rh, pr, pinfo = self.write_and_reread(idx, info)
+        _, _, drows, dinfo = png.palette_to_direct(rw, rh, pr, pinfo)
+        self.assertEqual([list(r) for r in drows], rows)
+        self.assertTrue(dinfo["alpha"])
+        self.assertEqual(dinfo["planes"], 4)
+
+    def test_overflow_refused(self):
+        """Exact conversion raises rather than silently substituting
+        colours when there are more distinct colours than capacity."""
+        rows = self.wide_rows(300)
+        self.assertRaises(
+            png.ProtocolError,
+            png.direct_to_palette,
+            300, 1, rows, self.rgb_info(300, 1))
+
+    def test_max_colors_capacity(self):
+        """The max_colors argument bounds the palette and is validated
+        against the 256 entry PNG limit."""
+        rows = self.wide_rows(300)
+        for bad in (0, -1, 257, 1.5):
+            self.assertRaises(
+                png.ProtocolError,
+                png.direct_to_palette,
+                300, 1, rows, self.rgb_info(300, 1),
+                max_colors=bad)
+
+    def test_quantize_capacity_and_error(self):
+        """Quantization never exceeds the requested capacity and reports
+        a bounded, non-negative colour error."""
+        rows = self.wide_rows(300)
+        _, _, idx, info, stats = png.direct_to_palette(
+            300, 1, rows, self.rgb_info(300, 1),
+            max_colors=16, quantize=True)
+        self.assertLessEqual(stats["colors"], 16)
+        self.assertLessEqual(len(info["palette"]), 16)
+        self.assertEqual(info["bitdepth"], 4)
+        self.assertTrue(stats["quantized"])
+        self.assertGreaterEqual(stats["max_error"], 0)
+        self.assertGreaterEqual(stats["mean_squared_error"], 0.0)
+        # Every emitted index must address a real palette entry.
+        for row in idx:
+            for value in row:
+                self.assertLess(value, len(info["palette"]))
+
+    def test_quantize_roundtrip_error_bounded(self):
+        """The colour difference across a quantized round trip is no
+        worse than the error that quantization reported."""
+        rows = self.wide_rows(300)
+        _, _, idx, info, stats = png.direct_to_palette(
+            300, 1, rows, self.rgb_info(300, 1),
+            max_colors=8, quantize=True)
+        rw, rh, pr, pinfo = self.write_and_reread(idx, info)
+        _, _, drows, _ = png.palette_to_direct(rw, rh, pr, pinfo)
+        original = [tuple(row) for row in rows]
+        reconstructed = [tuple(row) for row in drows]
+        worst = 0.0
+        for a, b in zip(original, reconstructed):
+            for p in zip(group(a, 3), group(b, 3)):
+                distance = math.sqrt(
+                    sum((x - y) ** 2 for x, y in zip(*p)))
+                worst = max(worst, distance)
+        self.assertLessEqual(worst, stats["max_error"] + 1e-9)
+
+    def test_bitdepth_boundaries(self):
+        """Index bit depth is the smallest legal one for the size."""
+        def bitdepth_for(n_colours):
+            rows = self.wide_rows(n_colours)
+            _, _, _, info, _ = png.direct_to_palette(
+                n_colours, 1, rows, self.rgb_info(n_colours, 1))
+            return info["bitdepth"]
+
+        self.assertEqual(bitdepth_for(1), 1)
+        self.assertEqual(bitdepth_for(2), 1)
+        self.assertEqual(bitdepth_for(3), 2)
+        self.assertEqual(bitdepth_for(4), 2)
+        self.assertEqual(bitdepth_for(5), 4)
+        self.assertEqual(bitdepth_for(16), 4)
+        self.assertEqual(bitdepth_for(17), 8)
+        self.assertEqual(bitdepth_for(256), 8)
+
+    def test_rejects_palette_input(self):
+        """Converting an already-palette image is a usage error."""
+        info = self.rgb_info(1, 1)
+        info["palette"] = [(1, 2, 3)]
+        info["colormap"] = True
+        self.assertRaises(
+            png.ProtocolError,
+            png.direct_to_palette, 1, 1, [[0]], info)
+
+    def test_rejects_greyscale_and_non8bit(self):
+        """Only 8-bit RGB/RGBA direct images are accepted."""
+        grey = {"size": (1, 1), "planes": 1, "bitdepth": 8,
+                "greyscale": True, "alpha": False}
+        self.assertRaises(
+            png.ProtocolError,
+            png.direct_to_palette, 1, 1, [[7]], grey)
+        deep = dict(self.rgb_info(1, 1), bitdepth=16)
+        self.assertRaises(
+            png.ProtocolError,
+            png.direct_to_palette,
+            1, 1, [[1, 2, 3]], deep)
+
+    def test_palette_to_direct_matches_as_direct(self):
+        """On real palette PNGs the conversion, including sBIT
+        reduction and tRNS alpha, must agree with Reader.asDirect."""
+        for name in ("basn3p04", "basi3p08", "cs3n3p08",
+                     "s09n3p02", "tbgn3p08"):
+            data = getattr(pngsuite, name)
+            probe = png.Reader(bytes=data)
+            probe.preamble()
+            sbit = probe.sbit
+            r1 = png.Reader(bytes=data)
+            w, h, pr, pinfo = r1.read()
+            _, _, drows, dinfo = png.palette_to_direct(
+                w, h, pr, pinfo, sbit=sbit)
+            r2 = png.Reader(bytes=data)
+            _, _, arows, ainfo = r2.asDirect()
+            self.assertEqual([list(r) for r in drows],
+                             [list(r) for r in arows])
+            self.assertEqual(dinfo["planes"], ainfo["planes"])
+            self.assertEqual(dinfo["bitdepth"], ainfo["bitdepth"])
+
+    def test_palette_to_direct_default_keeps_8bit(self):
+        """Without an explicit sbit the full 8-bit PLTE precision is
+        retained (no silent bit reduction)."""
+        r = png.Reader(bytes=pngsuite.basn3p04)
+        w, h, pr, pinfo = r.read()
+        _, _, drows, dinfo = png.palette_to_direct(w, h, pr, pinfo)
+        self.assertEqual(dinfo["bitdepth"], 8)
+        # Index 8 maps to a palette entry whose red channel is 255;
+        # asDirect with sBIT would have reduced it to 15.
+        self.assertEqual(list(drows)[0][0], 255)
+
+    def test_palette_to_direct_requires_palette(self):
+        self.assertRaises(
+            png.ProtocolError,
+            png.palette_to_direct,
+            1, 1, [[0]], self.rgb_info(1, 1))
+
+    def test_quantize_when_few_colours_is_exact(self):
+        """Quantizing an image that already fits the palette does not
+        invent extra colours or report an error."""
+        rows = [[255, 0, 0, 0, 255, 0],
+                [0, 0, 255, 255, 0, 0]]
+        _, _, idx, info, stats = png.direct_to_palette(
+            2, 2, rows, self.rgb_info(2, 2),
+            max_colors=256, quantize=True)
+        self.assertEqual(stats["max_error"], 0)
+        self.assertFalse(stats["quantized"])
+
+    def test_unconverted_paths_unchanged(self):
+        """A plain RGB write/read round trip not using the new functions
+        keeps producing identical bytes (default behaviour preserved)."""
+        rows = [[255, 0, 0, 0, 255, 0],
+                [0, 0, 255, 255, 255, 255]]
+        info = self.rgb_info(2, 2)
+        first = BytesIO()
+        png.Writer(**info).write(first, rows)
+        second = BytesIO()
+        png.Writer(**info).write(second, rows)
+        self.assertEqual(first.getvalue(), second.getvalue())
 
 
 if __name__ == "__main__":
