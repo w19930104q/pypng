@@ -1267,6 +1267,116 @@ class Test(unittest.TestCase):
         self.assertTrue(len(failed_runs) == 0, msg="%r failed" % failed_runs)
 
 
+def blockify(rows, n):
+    """Group an iterable of rows into blocks of at most `n` rows."""
+    block = []
+    for row in rows:
+        block.append(row)
+        if len(block) == n:
+            yield block
+            block = []
+    if block:
+        yield block
+
+
+class TestBlockPipeline(unittest.TestCase):
+    """Tests for the chunked (blocked) read/write pipeline:
+    Writer.write_blocks and Reader.read_blocks.
+    """
+
+    class failureException(Exception):
+        pass
+
+    @staticmethod
+    def make_rows(w, h, planes, bitdepth=8):
+        mask = (1 << bitdepth) - 1
+        state = 1
+        rows = []
+        for y in range(h):
+            row = []
+            for x in range(w * planes):
+                state = (1103515245 * state + 12345) & 0x7FFFFFFF
+                row.append((state ^ (x * 7) ^ (y * 13)) & mask)
+            rows.append(row)
+        return rows
+
+    def helper_blocked(self, w, h, planes, bitdepth, interlace):
+        greyscale = planes in (1, 2)
+        alpha = planes in (2, 4)
+        kargs = dict(width=w, height=h, greyscale=greyscale,
+                     alpha=alpha, bitdepth=bitdepth, interlace=interlace)
+        rows = self.make_rows(w, h, planes, bitdepth)
+
+        # Reference: legacy whole-image write.
+        ref = BytesIO()
+        png.Writer(**kargs).write(ref, [list(r) for r in rows])
+        ref_bytes = ref.getvalue()
+
+        # Chunked write must be byte-identical, and return the height.
+        out = BytesIO()
+        n = png.Writer(**kargs).write_blocks(
+            out, blockify((list(r) for r in rows), 3), block_limit=64)
+        self.assertEqual(n, h)
+        self.assertEqual(out.getvalue(), ref_bytes)
+
+        # Chunked read must yield the same rows as legacy read,
+        # in blocks of at most the requested size.
+        _, _, legacy_rows, _ = png.Reader(bytes=ref_bytes).read()
+        legacy_rows = [list(r) for r in legacy_rows]
+        w2, h2, blocks, info = png.Reader(bytes=ref_bytes).read_blocks(
+            block_limit=64, row_block=5)
+        self.assertEqual((w2, h2), (w, h))
+        blocked_rows = []
+        for block in blocks:
+            self.assertLessEqual(len(block), 5)
+            blocked_rows.extend(list(r) for r in block)
+        self.assertEqual(blocked_rows, legacy_rows)
+
+        # Round trip: block-read then block-write reproduces
+        # the original file exactly.
+        _, _, rt_blocks, rt_info = png.Reader(bytes=ref_bytes).read_blocks(
+            block_limit=64, row_block=4)
+        rt = BytesIO()
+        png.Writer(**rt_info).write_blocks(rt, rt_blocks, block_limit=64)
+        self.assertEqual(rt.getvalue(), ref_bytes)
+
+    def test_blocks_straight(self):
+        self.helper_blocked(19, 11, 3, 8, False)
+
+    def test_blocks_interlace(self):
+        self.helper_blocked(19, 11, 3, 8, True)
+
+    def test_blocks_interlace_rgba(self):
+        self.helper_blocked(16, 16, 4, 8, True)
+
+    def test_blocks_interlace_16bit(self):
+        self.helper_blocked(15, 9, 1, 16, True)
+
+    def test_blocks_interlace_1bit(self):
+        self.helper_blocked(33, 9, 1, 1, True)
+
+    def test_blocks_straight_4bit(self):
+        self.helper_blocked(17, 5, 1, 4, False)
+
+    def test_blocks_tiny_interlace(self):
+        self.helper_blocked(1, 1, 3, 8, True)
+        self.helper_blocked(2, 2, 4, 8, True)
+
+    def test_blocks_wrong_height(self):
+        w = png.Writer(4, 4, greyscale=True)
+        rows = self.make_rows(4, 3, 1)
+        self.assertRaises(
+            png.ProtocolError,
+            w.write_blocks, BytesIO(), blockify(iter(rows), 2))
+
+    def test_blocks_wrong_row_width(self):
+        w = png.Writer(4, 4, greyscale=True)
+        bad = [[0, 1, 2]] + self.make_rows(4, 3, 1)
+        self.assertRaises(
+            png.ProtocolError,
+            w.write_blocks, BytesIO(), blockify(iter(bad), 2))
+
+
 def read_modify_chunks(modify_chunk):
     """Create a temporary PNG file by modifying the chunks of
     an existing one, then read that temporary file.

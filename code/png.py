@@ -180,6 +180,7 @@ import operator
 import re
 import struct
 import sys
+import tempfile
 # http://www.python.org/doc/2.4.4/lib/module-warnings.html
 import warnings
 import zlib
@@ -635,42 +636,175 @@ class Writer:
         .. note ::
 
           Interlacing requires the entire image to be in working memory.
+          See :meth:`write_blocks` for a blocked alternative
+          that does not have this requirement.
         """
-
-        # Values per row
-        vpr = self.width * self.planes
-
-        def check_rows(rows):
-            """
-            Yield each row in rows,
-            but check each row first (for correct width).
-            """
-            for i, row in enumerate(rows):
-                try:
-                    wrong_length = len(row) != vpr
-                except TypeError:
-                    # When using an itertools.ichain object or
-                    # other generator not supporting __len__,
-                    # we set this to False to skip the check.
-                    wrong_length = False
-                if wrong_length:
-                    # Note: row numbers start at 0.
-                    raise ProtocolError(
-                        "Expected %d values but got %d values, in row %d" %
-                        (vpr, len(row), i))
-                yield row
 
         if self.interlace:
             fmt = 'BH'[self.bitdepth > 8]
-            a = array(fmt, itertools.chain(*check_rows(rows)))
+            a = array(fmt, itertools.chain(*self._checked_rows(rows)))
             return self.write_array(outfile, a)
 
-        nrows = self.write_passes(outfile, check_rows(rows))
+        nrows = self.write_passes(outfile, self._checked_rows(rows))
         if nrows != self.height:
             raise ProtocolError(
                 "rows supplied (%d) does not match height (%d)" %
                 (nrows, self.height))
         return nrows
+
+    def _checked_rows(self, rows):
+        """
+        Yield each row in `rows`,
+        checking each row first (for correct width).
+        """
+
+        # Values per row
+        vpr = self.width * self.planes
+
+        for i, row in enumerate(rows):
+            try:
+                wrong_length = len(row) != vpr
+            except TypeError:
+                # When using an itertools.chain object or
+                # other generator not supporting __len__,
+                # we set this to False to skip the check.
+                wrong_length = False
+            if wrong_length:
+                # Note: row numbers start at 0.
+                raise ProtocolError(
+                    "Expected %d values but got %d values, in row %d" %
+                    (vpr, len(row), i))
+            yield row
+
+    def write_blocks(self, outfile, blocks, block_limit=2**20):
+        """
+        Write a PNG image to the output file,
+        consuming the rows a block at a time so that
+        peak memory stays bounded (on the order of `block_limit`)
+        rather than growing with the size of the whole image.
+
+        `blocks` should be an iterable that yields blocks;
+        each block is an iterable of rows,
+        and each row is a sequence of values, as for :meth:`write`.
+        The rows appear in the usual top-to-bottom image order,
+        exactly as for :meth:`write`;
+        the blocks are simply a way of handing the rows over
+        a few at a time.
+
+        `block_limit` is an advisory memory budget (in bytes)
+        for the blocked pipeline;
+        the caller is expected to keep each block of rows
+        within this budget.
+
+        For straightlaced images the rows are filtered, compressed,
+        and written as they arrive;
+        no more than a block of rows and
+        the ``IDAT`` compression buffer (see `chunk_limit`)
+        are held in memory.
+
+        For interlaced images the rows cannot be emitted
+        in pass order until every row has been seen,
+        so the incoming rows are spooled to a temporary file
+        (kept off the Python heap);
+        the reduced pass scanlines are then read back
+        from the spool a row at a time.
+        Peak Python memory is therefore bounded
+        independently of the image size in this case too.
+
+        In both cases the output bytes are identical to those
+        that :meth:`write` produces for the same rows.
+
+        Returns the number of rows written
+        (which is checked against the image height).
+        """
+
+        if block_limit <= 0:
+            raise ProtocolError("block_limit must be positive")
+
+        rows = itertools.chain.from_iterable(blocks)
+        if self.interlace:
+            nrows = self._write_interlaced_blocks(outfile, rows)
+        else:
+            nrows = self.write_passes(outfile, self._checked_rows(rows))
+        if nrows != self.height:
+            raise ProtocolError(
+                "rows supplied (%d) does not match height (%d)" %
+                (nrows, self.height))
+        return nrows
+
+    def _write_interlaced_blocks(self, outfile, rows):
+        """
+        Write an interlaced PNG image to the output file,
+        spooling the incoming rows to a temporary file so that
+        the whole image is never held in working memory.
+        `rows` is an iterable of rows in image order.
+        Returns the number of rows consumed.
+        """
+
+        # Array type for the spooled values.
+        fmt = 'BH'[self.bitdepth > 8]
+        itemsize = array(fmt).itemsize
+        # Values per row.
+        vpr = self.width * self.planes
+        row_bytes = vpr * itemsize
+
+        spool = tempfile.TemporaryFile()
+        try:
+            nrows = 0
+            for row in self._checked_rows(rows):
+                spool.write(array(fmt, row))
+                nrows += 1
+            if nrows != self.height:
+                raise ProtocolError(
+                    "rows supplied (%d) does not match height (%d)" %
+                    (nrows, self.height))
+            self.write_passes(
+                outfile,
+                self._spooled_scanlines_interlace(spool, fmt, row_bytes))
+        finally:
+            spool.close()
+        return nrows
+
+    def _spooled_scanlines_interlace(self, spool, fmt, row_bytes):
+        """
+        Generate the reduced scanlines of an interlaced image,
+        reading each source row back from `spool`
+        (a file holding the image rows, `row_bytes` bytes each,
+        in the array format `fmt`).
+        Yields the same scanlines, with the same values, as
+        :meth:`array_scanlines_interlace` does
+        from an in-memory array of the whole image.
+        """
+
+        # Values per row
+        vpr = self.width * self.planes
+
+        # Each iteration generates a scanline starting at (x, y)
+        # and consisting of every xstep pixels.
+        for lines in adam7_generate(self.width, self.height):
+            for x, y, xstep in lines:
+                spool.seek(y * row_bytes)
+                row = array(fmt)
+                row.frombytes(spool.read(row_bytes))
+                if xstep == 1:
+                    # Easy case: the scanline is the whole row.
+                    yield row
+                    continue
+                # Pixels per row (of reduced image)
+                ppr = int(math.ceil((self.width - x) / float(xstep)))
+                # Values per row (of reduced image)
+                reduced_row_len = ppr * self.planes
+                # We have to step by xstep,
+                # which we can do one plane at a time
+                # using the step in Python slices.
+                reduced = array(fmt)
+                # There's no easier way to set the length of an array
+                reduced.extend(row[0:reduced_row_len])
+                offset = x * self.planes
+                skip = self.planes * xstep
+                for i in range(self.planes):
+                    reduced[i::self.planes] = row[offset + i::skip]
+                yield reduced
 
     def write_passes(self, outfile, rows):
         """
@@ -1806,6 +1940,45 @@ class Reader:
             struct.unpack(fmt, data)
         self.unit_is_meter = bool(unit)
 
+    def _iter_idat(self, lenient=False):
+        """Iterator that yields all the ``IDAT`` chunks as strings."""
+
+        while True:
+            type, data = self.chunk(lenient=lenient)
+            if type == b'IEND':
+                # http://www.w3.org/TR/PNG/#11IEND
+                break
+            if type != b'IDAT':
+                continue
+            # type == b'IDAT'
+            # http://www.w3.org/TR/PNG/#11IDAT
+            if self.colormap and not self.plte:
+                warnings.warn("PLTE chunk is required before IDAT chunk")
+            yield data
+
+    def _image_info(self):
+        """
+        Return the `info` dictionary
+        that describes the image being read,
+        as used by :meth:`read` and :meth:`read_blocks`.
+        """
+
+        info = dict()
+        for attr in 'greyscale alpha planes bitdepth interlace'.split():
+            info[attr] = getattr(self, attr)
+        info['size'] = (self.width, self.height)
+        for attr in 'gamma transparent background'.split():
+            a = getattr(self, attr, None)
+            if a is not None:
+                info[attr] = a
+        if getattr(self, 'x_pixels_per_unit', None):
+            info['physical'] = Resolution(self.x_pixels_per_unit,
+                                          self.y_pixels_per_unit,
+                                          self.unit_is_meter)
+        if self.plte:
+            info['palette'] = self.palette()
+        return info
+
     def read(self, lenient=False):
         """
         Read the PNG file and decode it.
@@ -1820,23 +1993,8 @@ class Reader:
         checksum failures will raise warnings rather than exceptions.
         """
 
-        def iteridat():
-            """Iterator that yields all the ``IDAT`` chunks as strings."""
-            while True:
-                type, data = self.chunk(lenient=lenient)
-                if type == b'IEND':
-                    # http://www.w3.org/TR/PNG/#11IEND
-                    break
-                if type != b'IDAT':
-                    continue
-                # type == b'IDAT'
-                # http://www.w3.org/TR/PNG/#11IDAT
-                if self.colormap and not self.plte:
-                    warnings.warn("PLTE chunk is required before IDAT chunk")
-                yield data
-
         self.preamble(lenient=lenient)
-        raw = decompress(iteridat())
+        raw = decompress(self._iter_idat(lenient=lenient))
 
         if self.interlace:
             def rows_from_interlace():
@@ -1855,21 +2013,121 @@ class Reader:
             rows = rows_from_interlace()
         else:
             rows = self._iter_bytes_to_values(self._iter_straight_packed(raw))
-        info = dict()
-        for attr in 'greyscale alpha planes bitdepth interlace'.split():
-            info[attr] = getattr(self, attr)
-        info['size'] = (self.width, self.height)
-        for attr in 'gamma transparent background'.split():
-            a = getattr(self, attr, None)
-            if a is not None:
-                info[attr] = a
-        if getattr(self, 'x_pixels_per_unit', None):
-            info['physical'] = Resolution(self.x_pixels_per_unit,
-                                          self.y_pixels_per_unit,
-                                          self.unit_is_meter)
-        if self.plte:
-            info['palette'] = self.palette()
-        return self.width, self.height, rows, info
+        return self.width, self.height, rows, self._image_info()
+
+    def read_blocks(self, lenient=False, block_limit=2**20, row_block=64):
+        """
+        Read the PNG file and decode it,
+        yielding the rows grouped into blocks so that
+        peak memory stays bounded (on the order of `block_limit`)
+        rather than growing with the size of the whole image.
+
+        Returns a 4-tuple (`width`, `height`, `blocks`, `info`),
+        like :meth:`read` except that instead of a sequence of rows
+        the third element is an iterator that yields blocks,
+        each block being a list of at most `row_block` rows.
+        Iterated in order, the rows are identical to those
+        that :meth:`read` yields.
+
+        Decompression is incremental:
+        no more than about `block_limit` bytes of decompressed data
+        are in flight at once,
+        and unfiltering proceeds a scanline at a time.
+        For interlaced images the reconstructed rows are
+        spooled to a temporary file (kept off the Python heap)
+        so that they can be yielded in image order
+        without holding the whole image in memory.
+
+        If the optional `lenient` argument evaluates to True,
+        checksum failures will raise warnings rather than exceptions.
+        """
+
+        if block_limit <= 0:
+            raise ProtocolError("block_limit must be positive")
+        if row_block <= 0:
+            raise ProtocolError("row_block must be positive")
+
+        self.preamble(lenient=lenient)
+        raw = _decompress_limited(
+            self._iter_idat(lenient=lenient), block_limit)
+
+        if self.interlace:
+            rows = self._iter_rows_interlace_spooled(raw)
+        else:
+            rows = self._iter_bytes_to_values(
+                self._iter_straight_packed(raw))
+        blocks = _group_rows_into_blocks(rows, row_block)
+        return self.width, self.height, blocks, self._image_info()
+
+    def _iter_rows_interlace_spooled(self, raw):
+        """
+        Yield each row of an interlaced image, in image order.
+        `raw` is an iterable that yields the decompressed
+        byte stream in blocks (of bounded size).
+        The reconstructed rows are spooled to a temporary file
+        (a row at a time) so that the whole image
+        is never held in working memory.
+        """
+
+        # Values per row (of the target image)
+        vpr = self.width * self.planes
+        fmt = 'BH'[self.bitdepth > 8]
+        itemsize = array(fmt).itemsize
+        row_bytes = vpr * itemsize
+
+        spool = tempfile.TemporaryFile()
+        try:
+            # Pre-size the spool so that every row can be read back
+            # (as zeroes) even before all of its passes
+            # have been written.
+            spool.truncate(row_bytes * self.height)
+            stream = _BlockStreamReader(raw)
+            for lines in adam7_generate(self.width, self.height):
+                # The previous (reconstructed) scanline.
+                # `None` at the beginning of a pass
+                # to indicate that there is no previous line.
+                recon = None
+                for x, y, xstep in lines:
+                    # Pixels per row (reduced pass image)
+                    ppr = int(math.ceil((self.width - x) / float(xstep)))
+                    # Row size in bytes for this pass.
+                    row_size = int(math.ceil(self.psize * ppr))
+
+                    filter_type = stream.read(1)
+                    scanline = stream.read(row_size)
+                    if len(filter_type) < 1 or len(scanline) < row_size:
+                        raise FormatError(
+                            'Decompressed IDAT chunk too short.')
+                    recon = self.undo_filter(filter_type[0], scanline, recon)
+                    # Convert so that there is one element per pixel value
+                    flat = self._bytes_to_values(recon, width=ppr)
+                    if xstep == 1:
+                        assert x == 0
+                        # The scanline is the whole row.
+                        spool.seek(y * row_bytes)
+                        spool.write(flat)
+                        continue
+                    # Splice the reduced scanline into its row.
+                    spool.seek(y * row_bytes)
+                    if itemsize == 1:
+                        row = bytearray(spool.read(row_bytes))
+                    else:
+                        row = array(fmt)
+                        row.frombytes(spool.read(row_bytes))
+                    offset = x * self.planes
+                    skip = self.planes * xstep
+                    for i in range(self.planes):
+                        row[offset + i::skip] = flat[i::self.planes]
+                    spool.seek(y * row_bytes)
+                    spool.write(row)
+
+            for y in range(self.height):
+                spool.seek(y * row_bytes)
+                row = array(fmt)
+                row.frombytes(spool.read(row_bytes))
+                yield row
+        finally:
+            spool.close()
 
     def read_flat(self):
         """
@@ -2195,6 +2453,83 @@ def decompress(data_blocks):
         # :todo: add a max_length argument here to limit output size.
         yield bytearray(d.decompress(data))
     yield bytearray(d.flush())
+
+
+def _decompress_limited(data_blocks, limit):
+    """
+    Like :func:`decompress`, but no yielded block exceeds
+    `limit` bytes, so that peak memory stays bounded
+    (on the order of `limit`) no matter how large
+    the individual ``IDAT`` chunks are.
+    """
+
+    d = zlib.decompressobj()
+    # Each IDAT chunk is passed to the decompressor, then any
+    # remaining state is decompressed out.
+    for data in data_blocks:
+        while data:
+            out = d.decompress(data, limit)
+            if out:
+                yield bytearray(out)
+            rest = d.unconsumed_tail
+            if not out and len(rest) >= len(data):
+                # The decompressor made no progress
+                # (for example, the compressed stream has ended);
+                # don't spin forever on indigestible input.
+                break
+            data = rest
+    # Drain any output the decompressor is still holding.
+    while True:
+        out = d.flush(limit)
+        if not out:
+            break
+        yield bytearray(out)
+        if len(out) < limit:
+            break
+
+
+def _group_rows_into_blocks(rows, row_block):
+    """
+    Group the rows yielded by `rows` into blocks;
+    each block is a list of at most `row_block` rows.
+    """
+
+    block = []
+    for row in rows:
+        block.append(row)
+        if len(block) >= row_block:
+            yield block
+            block = []
+    if block:
+        yield block
+
+
+class _BlockStreamReader:
+    """
+    Read exact numbers of bytes from an iterable of byte blocks,
+    buffering at most one block more than has been consumed.
+    """
+
+    def __init__(self, blocks):
+        self.blocks = iter(blocks)
+        self.buffer = bytearray()
+
+    def read(self, n):
+        """
+        Read up to `n` bytes (as a fresh bytearray);
+        fewer bytes are returned only at the end of the stream.
+        """
+
+        buf = self.buffer
+        while len(buf) < n:
+            try:
+                block = next(self.blocks)
+            except StopIteration:
+                break
+            buf.extend(block)
+        out = buf[:n]
+        del buf[:n]
+        return out
 
 
 def check_bitdepth_colortype(bitdepth, colortype):
