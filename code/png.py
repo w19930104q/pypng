@@ -42,6 +42,12 @@ For help, type ``import png; help(png)`` in your python interpreter.
 
 A good place to start is the :class:`Reader` and :class:`Writer` classes.
 
+A PNG whose image data is truncated part way through can still be
+partially recovered: :meth:`Reader.read_partial` yields every intact
+row (each identical to the corresponding row of the complete file)
+and reports the first damaged row together with a classified reason
+in a :class:`TruncationError`, instead of discarding the whole image.
+
 Coverage of PNG formats is fairly complete;
 all allowable bit depths (1/2/4/8/16/24/32/48/64 bits per pixel) and
 colour combinations are supported:
@@ -187,7 +193,10 @@ import zlib
 from array import array
 
 
-__all__ = ['Image', 'Reader', 'Writer', 'write_chunks', 'from_array']
+__all__ = [
+    'Image', 'Reader', 'Writer', 'TruncationError',
+    'write_chunks', 'from_array',
+]
 
 
 # The PNG signature.
@@ -343,6 +352,60 @@ class ProtocolError(Error):
 
 class ChunkError(FormatError):
     pass
+
+
+class TruncationError(FormatError):
+    """
+    Raised (or returned as the error object) when a PNG file is
+    truncated or otherwise damaged part way through its image data,
+    so that the intact rows preceding the damage can still be recovered.
+
+    Attributes:
+
+    ``reason``
+      A stable string classifying the cause.  One of:
+
+      ``'stream-truncated'``
+        The file ends inside a chunk (a declared ``IDAT`` chunk is
+        short of octets or its checksum is missing).
+      ``'stream-corrupt'``
+        The compressed image data (``IDAT`` contents) is damaged and
+        the zlib decompressor cannot continue past it.
+      ``'partial-row'``
+        The decompressed image data ends part way through a scanline,
+        so the row cannot be assembled completely.
+      ``'invalid-filter'``
+        A scanline declares a PNG filter type that is not valid
+        (not one of 0, 1, 2, 3, 4).
+
+    ``row``
+      Zero-based index of the first row that could not be recovered.
+    ``rows_recovered``
+      Number of intact rows recovered before the damage.
+    ``detail``
+      Optional human-readable string with further detail.
+    """
+
+    # Reasons are part of the public API.
+    STREAM_TRUNCATED = 'stream-truncated'
+    STREAM_CORRUPT = 'stream-corrupt'
+    PARTIAL_ROW = 'partial-row'
+    INVALID_FILTER = 'invalid-filter'
+
+    def __init__(self, reason, row, rows_recovered, detail=None):
+        self.reason = reason
+        self.row = row
+        self.rows_recovered = rows_recovered
+        self.detail = detail
+        super().__init__(self.__str__())
+
+    def __str__(self):
+        s = ('%s: damage at row %d after %d recovered row(s); reason: %s'
+             % (self.__class__.__name__,
+                self.row, self.rows_recovered, self.reason))
+        if self.detail:
+            s += ' (' + self.detail + ')'
+        return s
 
 
 class Default:
@@ -1320,6 +1383,33 @@ class Image:
         w.write(file, self.rows)
 
 
+class _PartialRows:
+    """Iterable wrapper for the rows recovered by
+    :meth:`Reader.read_partial`.
+
+    Behaves as an ordinary iterator of rows while being consumed, but
+    also exposes the terminal :class:`TruncationError` (or ``None``)
+    through the ``error`` attribute once iteration has finished.
+    """
+
+    def __init__(self, generator):
+        self._generator = generator
+        self.error = None
+        self._finished = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._generator)
+        except StopIteration as e:
+            # The generator returns the terminal error object.
+            self.error = e.value
+            self._finished = True
+            raise
+
+
 class Reader:
     """
     Pure Python PNG decoder in pure Python.
@@ -1806,6 +1896,116 @@ class Reader:
             struct.unpack(fmt, data)
         self.unit_is_meter = bool(unit)
 
+    def _iter_idat(self, lenient=False):
+        """Iterator that yields all the ``IDAT`` chunk data as strings,
+        raising on any truncation or other damage (strict behaviour).
+        """
+        while True:
+            type, data = self.chunk(lenient=lenient)
+            if type == b'IEND':
+                # http://www.w3.org/TR/PNG/#11IEND
+                break
+            if type != b'IDAT':
+                continue
+            # type == b'IDAT'
+            # http://www.w3.org/TR/PNG/#11IDAT
+            if self.colormap and not self.plte:
+                warnings.warn("PLTE chunk is required before IDAT chunk")
+            yield data
+
+    def _iter_idat_partial(self, on_damage):
+        """Like :meth:`_iter_idat`, but tolerant of a damaged file end.
+
+        Damage that makes further image data impossible to read is
+        reported through `on_damage` (a :class:`TruncationError` with
+        ``row`` set to -1, since row numbering is not known here);
+        whatever ``IDAT`` data could be read is still yielded.
+        """
+
+        # Total IDAT payload octets actually yielded.  Once image data
+        # has been delivered, an EOF in the trailing chunks is not
+        # reported here: the row-level completeness checks are the
+        # authority on whether whole rows are missing.
+        idat_bytes = 0
+        while True:
+            try:
+                if not self.atchunk:
+                    self.atchunk = self._chunk_len_type()
+                if not self.atchunk:
+                    # No more chunks at all (no IEND): just stop.
+                    break
+                length, type = self.atchunk
+                self.atchunk = None
+
+                data = self.file.read(length)
+                checksum = self.file.read(4)
+
+                if len(data) != length or len(checksum) != 4:
+                    if idat_bytes == 0:
+                        # No image data has been seen at all, so the
+                        # truncation is fatal to recovery.
+                        on_damage(TruncationError(
+                            TruncationError.STREAM_TRUNCATED,
+                            -1, 0,
+                            'chunk %s ends %d octet(s) short'
+                            % (type,
+                               (length - len(data)) +
+                               (4 - len(checksum)))))
+                    if data and type == b'IDAT':
+                        idat_bytes += len(data)
+                        yield data
+                    return
+            except (FormatError, ChunkError, EOFError) as e:
+                if idat_bytes == 0:
+                    on_damage(TruncationError(
+                        TruncationError.STREAM_TRUNCATED, -1, 0, str(e)))
+                return
+
+            verify = zlib.crc32(type)
+            verify = zlib.crc32(data, verify)
+            verify = struct.pack('!I', verify)
+            if checksum != verify:
+                (a, ) = struct.unpack('!I', checksum)
+                (b, ) = struct.unpack('!I', verify)
+                message = ("Checksum error in %s chunk: 0x%08X != 0x%08X."
+                           % (type.decode('ascii'), a, b))
+                warnings.warn(message, RuntimeWarning)
+
+            if type == b'IEND':
+                return
+            if type == b'IDAT':
+                if self.colormap and not self.plte:
+                    warnings.warn(
+                        "PLTE chunk is required before IDAT chunk")
+                idat_bytes += len(data)
+                yield data
+            # Other chunk types are ignored.
+
+        if idat_bytes == 0:
+            # Stream ended before any image data was available.
+            on_damage(TruncationError(
+                TruncationError.STREAM_TRUNCATED, -1, 0,
+                'no IDAT image data present'))
+
+    def _make_info(self):
+        """Build the info dictionary returned by the read methods."""
+
+        info = dict()
+        for attr in 'greyscale alpha planes bitdepth interlace'.split():
+            info[attr] = getattr(self, attr)
+        info['size'] = (self.width, self.height)
+        for attr in 'gamma transparent background'.split():
+            a = getattr(self, attr, None)
+            if a is not None:
+                info[attr] = a
+        if getattr(self, 'x_pixels_per_unit', None):
+            info['physical'] = Resolution(self.x_pixels_per_unit,
+                                          self.y_pixels_per_unit,
+                                          self.unit_is_meter)
+        if self.plte:
+            info['palette'] = self.palette()
+        return info
+
     def read(self, lenient=False):
         """
         Read the PNG file and decode it.
@@ -1820,23 +2020,8 @@ class Reader:
         checksum failures will raise warnings rather than exceptions.
         """
 
-        def iteridat():
-            """Iterator that yields all the ``IDAT`` chunks as strings."""
-            while True:
-                type, data = self.chunk(lenient=lenient)
-                if type == b'IEND':
-                    # http://www.w3.org/TR/PNG/#11IEND
-                    break
-                if type != b'IDAT':
-                    continue
-                # type == b'IDAT'
-                # http://www.w3.org/TR/PNG/#11IDAT
-                if self.colormap and not self.plte:
-                    warnings.warn("PLTE chunk is required before IDAT chunk")
-                yield data
-
         self.preamble(lenient=lenient)
-        raw = decompress(iteridat())
+        raw = decompress(self._iter_idat(lenient=lenient))
 
         if self.interlace:
             def rows_from_interlace():
@@ -1855,21 +2040,294 @@ class Reader:
             rows = rows_from_interlace()
         else:
             rows = self._iter_bytes_to_values(self._iter_straight_packed(raw))
-        info = dict()
-        for attr in 'greyscale alpha planes bitdepth interlace'.split():
-            info[attr] = getattr(self, attr)
-        info['size'] = (self.width, self.height)
-        for attr in 'gamma transparent background'.split():
-            a = getattr(self, attr, None)
-            if a is not None:
-                info[attr] = a
-        if getattr(self, 'x_pixels_per_unit', None):
-            info['physical'] = Resolution(self.x_pixels_per_unit,
-                                          self.y_pixels_per_unit,
-                                          self.unit_is_meter)
-        if self.plte:
-            info['palette'] = self.palette()
+        info = self._make_info()
         return self.width, self.height, rows, info
+
+    # Order in which damage reasons should be preferred when more than
+    # one is detected for the same image (most specific first).
+    _reason_rank = {
+        TruncationError.INVALID_FILTER: 0,
+        TruncationError.PARTIAL_ROW: 1,
+        TruncationError.STREAM_CORRUPT: 2,
+        TruncationError.STREAM_TRUNCATED: 3,
+    }
+
+    def _worse_damage(self, old, new):
+        """Return whichever of two :class:`TruncationError` objects
+        describes the more specific (preferred) damage.
+        """
+
+        if old is None:
+            return new
+        if self._reason_rank.get(new.reason, 99) < \
+                self._reason_rank.get(old.reason, 99):
+            return new
+        return old
+
+    def read_partial(self, lenient=False):
+        """
+        Read a possibly truncated or damaged PNG and recover as many
+        intact rows as possible.
+
+        Returns a 5-tuple
+        (`width`, `height`, `rows`, `info`, `error`).
+        The first four elements are as for :meth:`read`, except that
+        `height` is the height declared in the ``IHDR`` chunk (not the
+        number of rows actually recovered).
+        `rows` is a sequence of fully reconstructed rows; each row is
+        pixel for pixel identical to the corresponding row of the
+        complete file.
+        `error` is ``None`` when the image data is complete;
+        otherwise it is a :class:`TruncationError` whose ``reason``
+        classifies the damage, whose ``row`` is the zero-based index of
+        the first row that could not be recovered, and whose
+        ``rows_recovered`` is the number of intact rows yielded.
+
+        The `rows` iterator must be consumed before `error` is
+        meaningful, because damage is detected while rows are decoded.
+
+        A file whose header (signature or ``IHDR``) is damaged still
+        raises an exception, as there is nothing recoverable without
+        valid image metadata.
+        """
+
+        # Damage before the image data (for example truncation between
+        # the header and the first IDAT chunk) is recoverable as zero
+        # rows plus a structured error, but only once the IHDR has been
+        # parsed: a broken signature or IHDR still raises.
+        preamble_error = None
+        try:
+            self.preamble(lenient=lenient)
+        except (FormatError, EOFError) as e:
+            if not getattr(self, 'width', None):
+                # No valid IHDR: nothing recoverable.
+                raise
+            preamble_error = TruncationError(
+                TruncationError.STREAM_TRUNCATED, 0, 0, str(e))
+
+        damage = []
+
+        def record_damage(e):
+            if damage:
+                damage[0] = self._worse_damage(damage[0], e)
+            else:
+                damage.append(e)
+
+        if preamble_error is not None:
+            record_damage(preamble_error)
+
+        # Count rows as they are successfully reconstructed, so that
+        # chunk-level damage (reported with row == -1) can be rebased
+        # onto the actual row at which decoding stopped.
+        counter = [0]
+
+        def zlib_on_error(e):
+            e.row = counter[0]
+            e.rows_recovered = counter[0]
+            record_damage(e)
+
+        if preamble_error is None:
+            raw = decompress(
+                self._iter_idat_partial(record_damage),
+                on_error=zlib_on_error)
+        else:
+            raw = iter(())
+
+        if self.interlace:
+            rows = self._iter_partial_interlace(raw, counter, record_damage)
+        else:
+            rows = self._iter_partial_straight(raw, counter, record_damage)
+
+        def rows_and_error():
+            for row in rows:
+                yield row
+            if damage:
+                e = damage[0]
+                # Chunk-level damage carries no row number; rebase it to
+                # the first row that never made it out.
+                if e.row < 0:
+                    e.row = counter[0]
+                    e.rows_recovered = counter[0]
+                return e
+            return None
+
+        wrapped = _PartialRows(rows_and_error())
+        info = self._make_info()
+        return self.width, self.height, wrapped, info, wrapped
+
+    def _iter_partial_straight(self, byte_blocks, counter, record_damage):
+        """Yield intact reconstructed rows for a straightlaced image,
+        tolerating truncation and other damage in `byte_blocks`.
+        """
+
+        rb = self.row_bytes
+        a = bytearray()
+        # Total decompressed octets consumed, so that a stream ending on
+        # an exact row boundary but short of the IHDR-declared height is
+        # still detected.
+        consumed = 0
+        # The previous (reconstructed) scanline.
+        recon = None
+        for some_bytes in byte_blocks:
+            a.extend(some_bytes)
+            while len(a) >= rb + 1:
+                filter_type = a[0]
+                scanline = a[1: rb + 1]
+                del a[: rb + 1]
+                consumed += rb + 1
+                if filter_type not in (0, 1, 2, 3, 4):
+                    record_damage(TruncationError(
+                        TruncationError.INVALID_FILTER,
+                        counter[0], counter[0],
+                        'filter type %d is not valid' % filter_type))
+                    return
+                recon = self.undo_filter(filter_type, scanline, recon)
+                yield self._bytes_to_values(recon)
+                counter[0] += 1
+        if len(a) != 0:
+            # Decompressed data ends part way through a scanline; that
+            # row is incomplete and is deliberately not yielded.
+            record_damage(TruncationError(
+                TruncationError.PARTIAL_ROW,
+                counter[0], counter[0],
+                '%d of %d byte(s) present for row %d'
+                % (len(a), rb + 1, counter[0])))
+            return
+        expected = (rb + 1) * self.height
+        if consumed < expected:
+            # The stream is well-formed but simply runs out at (or
+            # before) a row boundary: whole rows are missing.
+            record_damage(TruncationError(
+                TruncationError.STREAM_TRUNCATED,
+                counter[0], counter[0],
+                'image data ends after %d of %d row(s)'
+                % (counter[0], self.height)))
+
+    def _iter_partial_interlace(self, byte_blocks, counter, record_damage):
+        """Yield intact reconstructed rows for an interlaced image,
+        tolerating truncation and other damage in `byte_blocks`.
+
+        A row is yielded only once every reduced scanline that
+        contributes to it has been recovered, so every yielded row is
+        complete and identical to the corresponding row of the
+        undamaged file.
+        """
+
+        vpr = self.width * self.planes
+        vpi = vpr * self.height
+        if self.bitdepth > 8:
+            out = array('H', [0] * vpi)
+        else:
+            out = bytearray([0] * vpi)
+
+        # Materialise the Adam7 geometry so each pass can be tracked.
+        passes = [list(lines)
+                  for lines in adam7_generate(self.width, self.height)]
+        # Number of reduced scanlines that must land in each image row
+        # before it is complete.
+        contributions = bytearray(self.height)
+        for lines in passes:
+            for x, y, xstep in lines:
+                contributions[y] += 1
+        # Reduced scanlines recovered so far for each image row.
+        coverage = bytearray(self.height)
+
+        bs = bytearray()
+        # Pull all available decompressed bytes first; decompression
+        # itself reports damage through its callback.
+        for some_bytes in byte_blocks:
+            bs.extend(some_bytes)
+
+        source_offset = 0
+        complete = True
+        for lines in passes:
+            recon = None
+            for x, y, xstep in lines:
+                ppr = int(math.ceil((self.width - x) / float(xstep)))
+                row_size = int(math.ceil(self.psize * ppr))
+                if source_offset + 1 + row_size > len(bs):
+                    for r in self._finished_interlace_rows(
+                            out, coverage, contributions, counter):
+                        yield r
+                    record_damage(TruncationError(
+                        TruncationError.PARTIAL_ROW,
+                        counter[0], counter[0],
+                        'interlaced data ends before row %d' % y))
+                    complete = False
+                    break
+                filter_type = bs[source_offset]
+                source_offset += 1
+                scanline = bs[source_offset: source_offset + row_size]
+                source_offset += row_size
+                if filter_type not in (0, 1, 2, 3, 4):
+                    for r in self._finished_interlace_rows(
+                            out, coverage, contributions, counter):
+                        yield r
+                    record_damage(TruncationError(
+                        TruncationError.INVALID_FILTER,
+                        counter[0], counter[0],
+                        'filter type %d is not valid' % filter_type))
+                    complete = False
+                    break
+                recon = self.undo_filter(filter_type, scanline, recon)
+                flat = self._bytes_to_values(recon, width=ppr)
+                if xstep == 1:
+                    assert x == 0
+                    offset = y * vpr
+                    out[offset: offset + vpr] = flat
+                else:
+                    offset = y * vpr + x * self.planes
+                    end_offset = (y + 1) * vpr
+                    skip = self.planes * xstep
+                    for i in range(self.planes):
+                        out[offset + i: end_offset: skip] = \
+                            flat[i:: self.planes]
+                coverage[y] += 1
+            if not complete:
+                break
+
+        if complete and source_offset < len(bs):
+            # Well-formed rows for every reduced scanline, but the
+            # stream still has unconsumed bytes: unexpected extra data,
+            # treated like a straightlaced wrong-size stream.
+            record_damage(TruncationError(
+                TruncationError.PARTIAL_ROW,
+                counter[0], counter[0],
+                '%d unexpected trailing byte(s) in interlaced data'
+                % (len(bs) - source_offset)))
+
+        # Only rows with every Adam7 contribution present are yielded,
+        # so recovered rows are always identical to those of the
+        # undamaged file (never zero-filled placeholders).
+        for r in self._finished_interlace_rows(
+                out, coverage, contributions, counter):
+            yield r
+        if complete and counter[0] < self.height:
+            # Data ended on a reduced-scanline boundary before all
+            # passes were delivered.
+            record_damage(TruncationError(
+                TruncationError.STREAM_TRUNCATED,
+                counter[0], counter[0],
+                'interlaced image data ends after %d of %d row(s)'
+                % (counter[0], self.height)))
+
+    def _finished_interlace_rows(self, out, coverage, contributions,
+                                 counter):
+        """Yield each image row whose Adam7 contributions are all
+        present, in natural top-to-bottom order, advancing `counter`.
+
+        Rows only become complete once the final Adam7 pass decodes
+        them, so complete rows always form a prefix starting at row 0.
+        """
+
+        arraycode = 'BH'[self.bitdepth > 8]
+        vpr = self.width * self.planes
+        y = counter[0]
+        while y < self.height and coverage[y] == contributions[y]:
+            offset = y * vpr
+            yield array(arraycode, out[offset: offset + vpr])
+            y += 1
+            counter[0] = y
 
     def read_flat(self):
         """
@@ -2178,23 +2636,53 @@ class Reader:
         return width, height, convert(), info
 
 
-def decompress(data_blocks):
+def decompress(data_blocks, on_error=None):
     """
     `data_blocks` should be an iterable that
     yields the compressed data (from the ``IDAT`` chunks).
     This yields decompressed byte strings.
+
+    If the optional `on_error` callback is supplied, it is called
+    with a single :class:`TruncationError` argument when the compressed
+    stream is truncated or corrupt; whatever the decompressor managed
+    to produce is still yielded, and no exception is raised.
+    Without the callback the original strict behaviour is retained:
+    a damaged stream raises the underlying ``zlib.error``.
     """
 
     # Currently, with no max_length parameter to decompress,
     # this routine will do one yield per IDAT chunk: Not very
     # incremental.
     d = zlib.decompressobj()
-    # Each IDAT chunk is passed to the decompressor, then any
-    # remaining state is decompressed out.
+
+    if on_error is None:
+        # Each IDAT chunk is passed to the decompressor, then any
+        # remaining state is decompressed out.
+        for data in data_blocks:
+            # :todo: add a max_length argument here to limit output size.
+            yield bytearray(d.decompress(data))
+        yield bytearray(d.flush())
+        return
+
+    # Partial-recovery path: keep going past damage and report it
+    # through the callback instead of raising.
     for data in data_blocks:
-        # :todo: add a max_length argument here to limit output size.
-        yield bytearray(d.decompress(data))
-    yield bytearray(d.flush())
+        try:
+            out = d.decompress(data)
+        except zlib.error as e:
+            on_error(TruncationError(
+                TruncationError.STREAM_CORRUPT,
+                -1, 0, str(e)))
+            return
+        yield bytearray(out)
+    try:
+        out = d.flush()
+    except zlib.error as e:
+        on_error(TruncationError(
+            TruncationError.STREAM_CORRUPT,
+            -1, 0, str(e)))
+        return
+    yield bytearray(out)
 
 
 def check_bitdepth_colortype(bitdepth, colortype):

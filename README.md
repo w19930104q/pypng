@@ -68,6 +68,21 @@ your current directory:
 
 Development moved to gitlab: https://gitlab.com/drj11/pypng
 
+New `Reader.read_partial()` method recovers intact rows from a
+truncated or otherwise damaged PNG file.
+It returns the usual
+`(width, height, rows, info)` together with an `error` object:
+`None` when the image data is complete,
+otherwise a `png.TruncationError` whose `reason` classifies the
+damage (`stream-truncated`, `stream-corrupt`, `partial-row`, or
+`invalid-filter`), whose `row` is the zero-based index of the first
+row that could not be recovered, and whose `rows_recovered` counts
+the intact rows.
+Every recovered row is pixel for pixel identical to the
+corresponding row of the complete file.
+The existing `Reader.read()` behaviour is unchanged and still raises
+on damaged files.
+
 If you pass an empty file to PyPNG
 it now raises the builtin Python exception `EOFError`.
 This should make it easier to diagnose _empty file_ problems separately

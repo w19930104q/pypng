@@ -23,6 +23,7 @@ import sys
 
 # http://www.python.org/doc/2.4.4/lib/module-unittest.html
 import unittest
+import warnings
 import zlib
 
 from array import array
@@ -1265,6 +1266,298 @@ class Test(unittest.TestCase):
             runs.append((path, status))
         failed_runs = [run for run in runs if run[1]]
         self.assertTrue(len(failed_runs) == 0, msg="%r failed" % failed_runs)
+
+    # ----- read_partial: recovery of truncated / damaged files -----
+
+    def _partial_png(self, width=9, height=8, **kw):
+        """Make a small PNG and return (bytes, full list of rows)."""
+
+        rows = [
+            bytearray((x * 13 + y * 29) & 0xFF for x in range(width))
+            for y in range(height)
+        ]
+        data = topngbytes("partial.png", rows, width, height,
+                          greyscale=True, bitdepth=8, **kw)
+        return data, rows
+
+    def _idat_payload(self, data):
+        """Decompress and return the concatenated IDAT payload."""
+
+        parts = []
+        pos = 8
+        while pos + 8 <= len(data):
+            length = int.from_bytes(data[pos:pos + 4], "big")
+            typ = data[pos + 4:pos + 8]
+            body = data[pos + 8:pos + 8 + length]
+            if typ == b"IDAT":
+                parts.append(body)
+            pos += 12 + length
+        return bytearray(zlib.decompress(b"".join(parts)))
+
+    def _rebuild_idat(self, data, new_payload):
+        """Recompress `new_payload` into a single IDAT, keeping other
+        chunks intact.
+        """
+
+        chunks = []
+        pos = 8
+        while pos + 8 <= len(data):
+            length = int.from_bytes(data[pos:pos + 4], "big")
+            typ = data[pos + 4:pos + 8]
+            body = data[pos + 8:pos + 8 + length]
+            chunks.append((typ, body))
+            pos += 12 + length
+        out = BytesIO()
+
+        def gen():
+            emitted = False
+            for typ, body in chunks:
+                if typ == b"IDAT":
+                    if not emitted:
+                        yield b"IDAT", zlib.compress(bytes(new_payload))
+                        emitted = True
+                    continue
+                yield typ, body
+
+        png.write_chunks(out, gen())
+        return out.getvalue()
+
+    def test_partial_intact_matches_read(self):
+        """An intact file read through read_partial is pixel identical
+        to read() and reports no error.
+        """
+
+        data, rows = self._partial_png()
+        _, _, strict_rows, _ = png.Reader(bytes=data).read()
+        w, h, prow, info, wrapper = png.Reader(bytes=data).read_partial()
+        recovered = list(prow)
+        self.assertEqual(w, 9)
+        self.assertEqual(h, 8)
+        self.assertIsNone(wrapper.error)
+        self.assertEqual(recovered, list(strict_rows))
+        self.assertEqual([list(r) for r in recovered],
+                         [list(r) for r in rows])
+
+    def test_partial_physical_truncation(self):
+        """Truncating the file tail recovers a pixel-identical prefix."""
+
+        data, rows = self._partial_png()
+        for cut in (1, 5, 12, 25, 40):
+            r = png.Reader(bytes=data[:-cut])
+            _, _, prow, _, wrapper = r.read_partial()
+            recovered = list(prow)
+            error = wrapper.error
+            n = len(recovered)
+            self.assertEqual([list(row) for row in recovered],
+                             [list(row) for row in rows[:n]])
+            # A cut that only removes the IEND trailer leaves the
+            # image data intact, so an error is expected only when some
+            # image row was actually lost.
+            if n < len(rows):
+                self.assertIsNotNone(error)
+                self.assertEqual(error.row, n)
+                self.assertEqual(error.rows_recovered, n)
+                self.assertIn(error.reason,
+                              (png.TruncationError.STREAM_TRUNCATED,
+                               png.TruncationError.PARTIAL_ROW,
+                               png.TruncationError.STREAM_CORRUPT))
+
+    def test_partial_partial_row_reason(self):
+        """Data ending mid-scanline is classified partial-row and the
+        incomplete row is not delivered.
+        """
+
+        data, rows = self._partial_png(width=9, height=8)
+        payload = self._idat_payload(data)
+        stride = 9 + 1  # one filter byte plus nine sample bytes
+        # Drop between 1 and stride-1 bytes so the final scanline is
+        # incomplete but whole rows precede it.
+        for drop in range(1, stride):
+            bad = self._rebuild_idat(data, payload[:-drop])
+            _, _, prow, _, wrapper = png.Reader(bytes=bad).read_partial()
+            recovered = list(prow)
+            error = wrapper.error
+            n = len(recovered)
+            self.assertEqual([list(r) for r in recovered],
+                             [list(r) for r in rows[:n]])
+            self.assertEqual(error.reason,
+                             png.TruncationError.PARTIAL_ROW)
+            self.assertEqual(error.row, n)
+            self.assertEqual(error.rows_recovered, n)
+
+    def test_partial_exact_row_boundary(self):
+        """A well-formed stream ending on an exact row boundary but
+        short of the declared height is still a truncation.
+        """
+
+        data, rows = self._partial_png(width=9, height=8)
+        payload = self._idat_payload(data)
+        stride = 10
+        kept_rows = 5
+        bad = self._rebuild_idat(data, payload[:kept_rows * stride])
+        _, _, prow, _, wrapper = png.Reader(bytes=bad).read_partial()
+        recovered = list(prow)
+        error = wrapper.error
+        self.assertEqual(len(recovered), kept_rows)
+        self.assertEqual([list(r) for r in recovered],
+                         [list(r) for r in rows[:kept_rows]])
+        self.assertEqual(error.reason,
+                         png.TruncationError.STREAM_TRUNCATED)
+        self.assertEqual(error.row, kept_rows)
+        self.assertEqual(error.rows_recovered, kept_rows)
+
+    def test_partial_invalid_filter_reason(self):
+        """An impossible filter byte is located to its row."""
+
+        data, rows = self._partial_png(width=9, height=8)
+        payload = bytearray(self._idat_payload(data))
+        stride = 10
+        bad_row = 4
+        payload[bad_row * stride] = 99
+        bad = self._rebuild_idat(data, payload)
+        _, _, prow, _, wrapper = png.Reader(bytes=bad).read_partial()
+        recovered = list(prow)
+        error = wrapper.error
+        self.assertEqual(len(recovered), bad_row)
+        self.assertEqual([list(r) for r in recovered],
+                         [list(r) for r in rows[:bad_row]])
+        self.assertEqual(error.reason,
+                         png.TruncationError.INVALID_FILTER)
+        self.assertEqual(error.row, bad_row)
+        self.assertEqual(error.rows_recovered, bad_row)
+
+    def test_partial_stream_corrupt_reason(self):
+        """Corrupt compressed data is classified stream-corrupt and
+        preceding intact rows are still delivered.
+        """
+
+        data, rows = self._partial_png(width=9, height=8)
+        # Corrupt a byte near the start of the single IDAT chunk.
+        r = png.Reader(bytes=data)
+        chunks = list(r.chunks())
+        out = BytesIO()
+
+        def gen():
+            for typ, body in chunks:
+                if typ == b"IDAT":
+                    body = bytearray(body)
+                    body[1] ^= 0xFF
+                    body = bytes(body)
+                yield typ, body
+
+        png.write_chunks(out, gen())
+        bad = out.getvalue()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _, _, prow, _, wrapper = png.Reader(bytes=bad).read_partial()
+            recovered = list(prow)
+            error = wrapper.error
+        n = len(recovered)
+        self.assertEqual(recovered, rows[:n])
+        self.assertEqual(error.reason,
+                         png.TruncationError.STREAM_CORRUPT)
+        self.assertEqual(error.row, n)
+        self.assertEqual(error.rows_recovered, n)
+
+    def test_partial_reasons_are_classified(self):
+        """All four documented reason constants exist and are strings."""
+
+        for name in ("STREAM_TRUNCATED", "STREAM_CORRUPT",
+                     "PARTIAL_ROW", "INVALID_FILTER"):
+            value = getattr(png.TruncationError, name)
+            self.assertIsInstance(value, str)
+
+    def test_partial_strict_read_still_raises(self):
+        """The ordinary read() path keeps raising on truncation."""
+
+        data, _ = self._partial_png()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            r = png.Reader(bytes=data[:-30])
+            _, _, strict_rows, _ = r.read()
+            self.assertRaises(png.Error, list, strict_rows)
+
+    def test_partial_header_damage_still_raises(self):
+        """Damage before a usable IHDR leaves nothing to recover."""
+
+        data, _ = self._partial_png()
+        # Keep the signature but destroy the IHDR checksum.
+        r = png.Reader(bytes=data[:29])
+        self.assertRaises(png.FormatError, r.read_partial)
+
+    def test_partial_interlaced_prefix(self):
+        """Recovered interlaced rows form a pixel-identical prefix."""
+
+        data, rows = self._partial_png(width=11, height=9, interlace=True)
+        for cut in (1, 8, 20, 40, 80):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                r = png.Reader(bytes=data[:-cut])
+                _, _, prow, _, wrapper = r.read_partial()
+                recovered = list(prow)
+                error = wrapper.error
+            n = len(recovered)
+            self.assertEqual([list(r) for r in recovered],
+                             [list(r) for r in rows[:n]])
+            # When rows are missing the damage must be located to the
+            # first unrecovered row; a fully recovered prefix carries
+            # no requirement on the (possibly trailer-only) error.
+            if n < len(rows):
+                self.assertIsNotNone(error)
+                self.assertEqual(error.row, n)
+                self.assertEqual(error.rows_recovered, n)
+
+    def test_partial_interlaced_intact(self):
+        """An intact interlaced file recovers every row, no error."""
+
+        data, rows = self._partial_png(width=11, height=9, interlace=True)
+        _, _, prow, _, wrapper = png.Reader(bytes=data).read_partial()
+        recovered = list(prow)
+        self.assertIsNone(wrapper.error)
+        self.assertEqual([list(r) for r in recovered],
+                         [list(r) for r in rows])
+
+    def test_partial_many_formats(self):
+        """Pixel-identical prefix recovery across bit depths and types."""
+
+        width, height = 7, 6
+        max16 = 0xFFFF
+        cases = [
+            (dict(greyscale=True, bitdepth=1),
+             [[(x + y) & 1 for x in range(width)] for y in range(height)]),
+            (dict(greyscale=True, bitdepth=4),
+             [[(x * 3 + y) & 0xF for x in range(width)]
+              for y in range(height)]),
+            (dict(greyscale=True, bitdepth=16),
+             [[(x * 1000 + y * 7) & max16 for x in range(width)]
+              for y in range(height)]),
+            (dict(greyscale=False, bitdepth=8),
+             [list(itertools.chain(
+                 *[(x * 9 + y, x * 5 + y * 2, x + y * 11)
+                   for x in range(width)]))
+              for y in range(height)]),
+            (dict(greyscale=False, alpha=True, bitdepth=8),
+             [list(itertools.chain(
+                 *[(x, y, x + y, 255) for x in range(width)]))
+              for y in range(height)]),
+        ]
+        for kw, rows in cases:
+            data = topngbytes("partial_fmt.png", rows, width, height, **kw)
+            for cut in (3, 17, 33):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    r = png.Reader(bytes=data[:-cut])
+                    _, _, prow, _, wrapper = r.read_partial()
+                    recovered = list(prow)
+                n = len(recovered)
+                self.assertEqual(
+                    [list(row) for row in recovered],
+                    [list(row) for row in rows[:n]],
+                    msg="format %r cut %d" % (kw, cut))
+                error = wrapper.error
+                if n < height:
+                    self.assertIsNotNone(error)
+                    self.assertEqual(error.rows_recovered, n)
 
 
 def read_modify_chunks(modify_chunk):
